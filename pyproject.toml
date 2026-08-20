@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hbc-protocol"
+version = "1.2.0"
+description = "Ham Binary Cursor on Target (HBC) Protocol — encoder and decoder for CoT messages over ham radio"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+dependencies = [
+    "takproto @ git+https://github.com/snstac/takproto.git",
+]
+
+[project.urls]
+Homepage = "https://github.com/ke8tqb/HBC-Protocol"
+
+# Expose hbc_encoder and hbc_decoder as top-level importable modules.
+# Keeps the existing import API:
+#   from hbc_encoder import encode
+#   from hbc_decoder import decode
+[tool.setuptools]
+py-modules = ["hbc_encoder", "hbc_decoder"]
