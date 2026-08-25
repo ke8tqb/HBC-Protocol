@@ -12,7 +12,8 @@ Supported HBC modes
 -------------------
   Mode 1 (000) : Minimum PLI or Spot Message
   Mode 2 (001) : Alert Message — active or cancelled (1-bit alert status)
-  Mode 3 (010) : GeoChat Text Message  (b-t-f — ITA2 text, CR-terminated)
+  Mode 3 (010) : GeoChat Text Message  (b-t-f — addressed to All Chat Rooms,
+                 a named room, or a single station via direct message)
   Mode 4 (011) : Shape  (u-d-c-c circle, u-d-r rectangle, u-d-f freeform)
   Mode 5 (100) : CASEVAC / MEDEVAC  (b-r-f-h-c — 9-line numeric fields)
 
@@ -63,6 +64,17 @@ _DEFAULT_MODE     = 1          # Mode 1 for all unrecognised types
 
 # CoT type prefixes that produce a PLI bit of 0 (moving unit)
 _PLI_PREFIXES     = ('a-f-G', 'a-h-G', 'a-n-G')
+
+# =============================================================================
+# MODE 3 (v1.4) — GeoChat destination kinds
+# =============================================================================
+# 2-bit field selecting who a GeoChat message is addressed to. All Chat Rooms
+# remains the default/broadcast destination; Named Room and Direct Message
+# were added in v1.4 without introducing a new mode number.
+CHAT_DEST_ALL  = 0   # 00 — All Chat Rooms (broadcast, default)
+CHAT_DEST_ROOM = 1   # 01 — Named/custom chat room
+CHAT_DEST_DM   = 2   # 10 — Direct message to a single station callsign
+#                       11 — reserved
 
 # =============================================================================
 # MODE 6 (v1.3) — Extended Marker constants
@@ -176,8 +188,12 @@ class HBCMessage:
     orig_name_bits:       str  = field(default='', repr=False)
 
     # Mode 3 — GeoChat
-    chat_text: str = ''
-    chat_bits: str = field(default='', repr=False)
+    chat_text:      str  = ''
+    chat_bits:      str  = field(default='', repr=False)
+    chat_dest_kind: int  = CHAT_DEST_ALL   # 0 all, 1 named room, 2 direct message
+    chat_room:      str  = ''              # room name (dest kind 1)
+    chat_recipient: str  = ''              # recipient callsign (dest kind 2)
+    chat_dest_bits: str  = field(default='', repr=False)
 
     # Mode 4 — Shape (name/name_len_bits/name_ascii_bits above are reused for the label)
     shape_kind:   int  = 0     # 0 = circle, 1 = closed polygon, 2 = open polyline
@@ -216,8 +232,9 @@ class HBCMessage:
                     + self.orig_len_bits  + self.orig_name_bits
                     + self.lat_bits + self.lon_bits)
         if self.mode == 3:
+            # Destination kind (2 bits) + optional room/recipient +
             # ITA2 message text, CR-terminated (no coordinates)
-            return self.chat_bits
+            return self.chat_dest_bits + self.chat_bits
         if self.mode == 4:
             # Shape kind + name + kind-specific body (coords live in shape_bits)
             return (format(self.shape_kind, '02b')
@@ -279,6 +296,15 @@ class HBCMessage:
                 f'  orig_name     : {self.orig_name!r}  ->  {self.orig_name_bits}  [{len(self.orig_name_bits)}b]',
             ]
         elif self.mode == 3:
+            kind_name = {0: 'All Chat Rooms', 1: 'Named Room', 2: 'Direct Message'}.get(
+                self.chat_dest_kind, '?')
+            lines += [
+                f'  dest_kind     : {kind_name}({self.chat_dest_kind})  ->  {format(self.chat_dest_kind, "02b")}',
+            ]
+            if self.chat_dest_kind == CHAT_DEST_ROOM:
+                lines += [f'  room          : {self.chat_room!r}']
+            elif self.chat_dest_kind == CHAT_DEST_DM:
+                lines += [f'  recipient     : {self.chat_recipient!r}']
             lines += [
                 f'  chat_text     : {self.chat_text!r}  ->  {self.chat_bits}  [{len(self.chat_bits)}b]',
             ]
@@ -516,18 +542,45 @@ def _parse_xml(data) -> dict:
     # ------------------------------------------------------------------
     # Mode 3 — GeoChat
     # Sender callsign from __chat/@senderCallsign; text from <remarks>.
+    #
+    # Destination classification (v1.4):
+    #   chatroom missing or "All Chat Rooms"  -> CHAT_DEST_ALL (broadcast)
+    #   <chatgrp> has 3+ uidN members          -> CHAT_DEST_ROOM (named room)
+    #   otherwise (exactly uid0 + uid1)        -> CHAT_DEST_DM (direct message;
+    #                                              chatroom carries the
+    #                                              recipient's callsign, as
+    #                                              ATAK labels a 1:1 chat tab)
     # ------------------------------------------------------------------
     if hbc_mode == 3:
-        sender = message = ''
+        sender = message = chatroom = ''
+        dest_kind = CHAT_DEST_ALL
+        chat_room = chat_recipient = ''
         if detail is not None:
             chat = detail.find('__chat')
             if chat is not None:
                 sender = chat.get('senderCallsign', '')
+                chatroom = chat.get('chatroom', '') or chat.get('id', '')
+                chatgrp = chat.find('chatgrp')
+                member_count = 0
+                if chatgrp is not None:
+                    member_count = sum(
+                        1 for k in chatgrp.keys()
+                        if k.startswith('uid') and k[3:].isdigit())
+                if not chatroom or chatroom.strip().lower() == 'all chat rooms':
+                    dest_kind = CHAT_DEST_ALL
+                elif member_count >= 3:
+                    dest_kind = CHAT_DEST_ROOM
+                    chat_room = chatroom
+                else:
+                    dest_kind = CHAT_DEST_DM
+                    chat_recipient = chatroom
             remarks = detail.find('remarks')
             if remarks is not None and remarks.text:
                 message = remarks.text.strip()
         return dict(hbc_mode=3, cot_type=cot_type,
-                    callsign=sender, message=message)
+                    callsign=sender, message=message,
+                    dest_kind=dest_kind, chat_room=chat_room,
+                    chat_recipient=chat_recipient)
 
     # ------------------------------------------------------------------
     # Mode 4 — Shape (circle / rectangle / freeform)
@@ -669,18 +722,36 @@ def _parse_takproto(data: bytes) -> dict:
     # ------------------------------------------------------------------
     # Mode 3 — GeoChat (takproto path)
     # __chat and <remarks> are non-standard details carried in xmlDetail.
+    # Destination classification mirrors the XML path (see _parse_xml).
     # ------------------------------------------------------------------
     if hbc_mode == 3:
         xd = cot.detail.xmlDetail or ''
-        sender = message = ''
+        sender = message = chatroom = ''
+        dest_kind = CHAT_DEST_ALL
+        chat_room = chat_recipient = ''
         m = re.search(r'<__chat[^>]*\bsenderCallsign=["\']([^"\']*)["\']', xd)
         if m:
             sender = m.group(1)
+        m = re.search(r'<__chat[^>]*\bchatroom=["\']([^"\']*)["\']', xd)
+        if m:
+            chatroom = m.group(1)
+        cg = re.search(r'<chatgrp([^>]*)/?>', xd)
+        member_count = len(re.findall(r'\buid\d+=', cg.group(1))) if cg else 0
+        if not chatroom or chatroom.strip().lower() == 'all chat rooms':
+            dest_kind = CHAT_DEST_ALL
+        elif member_count >= 3:
+            dest_kind = CHAT_DEST_ROOM
+            chat_room = chatroom
+        else:
+            dest_kind = CHAT_DEST_DM
+            chat_recipient = chatroom
         m = re.search(r'<remarks[^>]*>([^<]*)</remarks>', xd)
         if m:
             message = m.group(1).strip()
         return dict(hbc_mode=3, cot_type=cot_type,
-                    callsign=sender, message=message)
+                    callsign=sender, message=message,
+                    dest_kind=dest_kind, chat_room=chat_room,
+                    chat_recipient=chat_recipient)
 
     # ------------------------------------------------------------------
     # Mode 4 — Shape (takproto path)
@@ -796,23 +867,41 @@ def _build_mode2(*, cot_type, callsign, alert_callsign, active, lat, lon, source
     )
 
 
-def _build_mode3(*, cot_type, callsign, message, source_format) -> HBCMessage:
-    """Mode 3 — GeoChat Text Message.
+def _build_mode3(*, cot_type, callsign, message, source_format,
+                  dest_kind=CHAT_DEST_ALL, chat_room='', chat_recipient='') -> HBCMessage:
+    """Mode 3 — GeoChat Text Message (v1.4 adds addressed destinations).
 
     Wire format (payload only; header is standard callsign+version+mode):
-      message  ITA2-encoded, CR-terminated  (5 bits/char + shifts)
+      dest_kind          [2 bits]  00 = All Chat Rooms, 01 = Named Room,
+                                   10 = Direct Message, 11 = reserved
+      [Named Room]       room name        ITA2, CR-terminated (free text)
+      [Direct Message]   recipient        ITA2, CR-terminated (max 8 chars,
+                                           same alphabet as the header callsign)
+      message            ITA2-encoded, CR-terminated  (5 bits/char + shifts)
 
     No coordinates are transmitted — TAK chat events carry no meaningful
     position (WinTAK sends lat=0 lon=0).  Text is uppercased by ITA2.
     """
     cs_bits   = _ita2_encode_callsign(callsign)
     chat_bits = _ita2_encode_text(message)
+
+    dest_bits = format(dest_kind, '02b')
+    room = recipient = ''
+    if dest_kind == CHAT_DEST_ROOM:
+        room = chat_room
+        dest_bits += _ita2_encode_text(chat_room)
+    elif dest_kind == CHAT_DEST_DM:
+        recipient = chat_recipient.upper()[:MAX_CS_CHARS]
+        dest_bits += _ita2_encode_callsign(chat_recipient)
+
     return HBCMessage(
         mode=3, source_format=source_format, cot_type=cot_type,
         callsign=callsign, lat=0.0, lon=0.0,
         lat_int=0, lon_int=0,
         callsign_bits=cs_bits, lat_bits='', lon_bits='',
         chat_text=message, chat_bits=chat_bits,
+        chat_dest_kind=dest_kind, chat_room=room, chat_recipient=recipient,
+        chat_dest_bits=dest_bits,
     )
 
 
@@ -1118,7 +1207,7 @@ if __name__ == '__main__':
          b'\x12\r\x12\x0bbobby-Alert'),
 
         # --- Modes 3-5: real WinTAK events from cot_capture.xml (8-18-26) ---
-        ('Mode 3 — XML GeoChat (RECEIVER: test message)',
+        ('Mode 3 — XML GeoChat, All Chat Rooms (RECEIVER: test message)',
          '''<event version="2.0" uid="GeoChat.S-1-5-21.All Chat Rooms.3f8d87e7" type="b-t-f"
               time="2026-08-19T01:15:28.470Z" start="2026-08-19T01:15:28.470Z"
               stale="2026-08-20T01:15:28.470Z" how="h-g-i-g-o">
@@ -1131,6 +1220,42 @@ if __name__ == '__main__':
               <link uid="S-1-5-21" type="a-f-G-U" relation="p-p" />
               <remarks source="BAO.F.WinTAK.S-1-5-21" to="All Chat Rooms"
                        time="2026-08-19T01:15:28.47Z">test message</remarks>
+            </detail>
+          </event>'''),
+
+        ('Mode 3 — XML GeoChat, Named Room (RECEIVER -> Recon Team: status check)',
+         '''<event version="2.0" uid="GeoChat.S-1-5-21.9f8e7d6c.a1b2c3d4" type="b-t-f"
+              time="2026-08-25T14:02:11.00Z" start="2026-08-25T14:02:11.00Z"
+              stale="2026-08-26T14:02:11.00Z" how="h-g-i-g-o">
+            <point lat="0" lon="0" hae="9999999.0" ce="9999999.0" le="9999999.0" />
+            <detail>
+              <__chat id="9f8e7d6c-0000-0000-0000-000000000000" chatroom="Recon Team"
+                      senderCallsign="RECEIVER" groupOwner="false"
+                      messageId="a1b2c3d4-0000-0000-0000-000000000000">
+                <chatgrp id="9f8e7d6c-0000-0000-0000-000000000000" uid0="S-1-5-21"
+                         uid1="ANDROID-aaaa" uid2="ANDROID-bbbb" />
+              </__chat>
+              <link uid="S-1-5-21" type="a-f-G-U" relation="p-p" />
+              <remarks source="BAO.F.WinTAK.S-1-5-21" to="Recon Team"
+                       time="2026-08-25T14:02:11.00Z">status check</remarks>
+            </detail>
+          </event>'''),
+
+        ('Mode 3 — XML GeoChat, Direct Message (RECEIVER -> ONYX: helo landing zone)',
+         '''<event version="2.0" uid="GeoChat.S-1-5-21.c07f979e.e0295a69" type="b-t-f"
+              time="2026-08-25T14:05:00.00Z" start="2026-08-25T14:05:00.00Z"
+              stale="2026-08-26T14:05:00.00Z" how="h-g-i-g-o">
+            <point lat="0" lon="0" hae="9999999.0" ce="9999999.0" le="9999999.0" />
+            <detail>
+              <__chat id="c07f979e-0000-0000-0000-000000000000" chatroom="ONYX"
+                      senderCallsign="RECEIVER" groupOwner="false"
+                      messageId="e0295a69-0000-0000-0000-000000000000">
+                <chatgrp id="c07f979e-0000-0000-0000-000000000000" uid0="S-1-5-21"
+                         uid1="ANDROID-onyxuid" />
+              </__chat>
+              <link uid="S-1-5-21" type="a-f-G-U" relation="p-p" />
+              <remarks source="BAO.F.WinTAK.S-1-5-21" to="ONYX"
+                       time="2026-08-25T14:05:00.00Z">helo landing zone</remarks>
             </detail>
           </event>'''),
 

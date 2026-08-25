@@ -34,7 +34,20 @@ The header always contains the transmitting station's callsign in ITA2 encoding,
 
 ## Protocol Version
 
-**Version 1.3** — Modes 1 through 6 defined.
+**Version 1.4** — Modes 1 through 6 defined.
+
+v1.4 updates Mode 3 (GeoChat) to carry an addressed destination instead of
+always broadcasting to All Chat Rooms. A new 2-bit destination-kind field
+is inserted immediately after the mode header, followed by a room name or
+recipient callsign when applicable: `00` All Chat Rooms (unchanged
+behavior, no extra field), `01` Named Room (ITA2 room name, CR-terminated),
+`10` Direct Message (ITA2 recipient callsign, CR-terminated, same alphabet
+as the header callsign), `11` reserved. Direct-message recipients are
+addressed by callsign and resolve to the same deterministic `HBC-{CALLSIGN}`
+UID used elsewhere, so a DM automatically correlates with that station's
+PLI contact. This is **not** a new mode number — Mode 3's bits (`010`) are
+unchanged — but the payload layout changed, so v1.4 Mode 3 bit streams are
+NOT compatible with v1.3 and earlier Mode 3 frames.
 
 v1.3 adds Mode 6 (Extended Marker): placed markers now transmit their full
 CoT type string plus an icon reference (MIL-STD-2525 mapping, spot-map
@@ -96,7 +109,14 @@ PAYLOAD (mode-dependent)
     Latitude            21 bits (two's complement x10,000, ~11 m precision)
     Longitude           22 bits (two's complement x10,000, ~11 m precision)
 
-  Mode 3 — GeoChat
+  Mode 3 — GeoChat (v1.4)
+    Destination Kind    2 bits  (00 = All Chat Rooms, 01 = Named Room,
+                                 10 = Direct Message, 11 = reserved)
+    Named Room:
+      Room Name         ITA2-encoded, CR-terminated  (free text)
+    Direct Message:
+      Recipient         ITA2-encoded, CR-terminated  (max 8 chars, same
+                        alphabet as the header callsign)
     Message             ITA2-encoded, CR-terminated  (5 bits/char + shifts)
                         Uppercase only; non-ITA2 characters become '?'.
                         No coordinates are transmitted.
@@ -256,7 +276,9 @@ present in the header, using a fixed formula:
 | Mode 1 PLI (PLI bit = 0) | `"HBC-" + CALLSIGN` | `HBC-KE8TQB` |
 | Mode 1 Spot (PLI bit = 1) | Random UUID4 | `f1907ab4-7402-...` (new each decode) |
 | Mode 2 Alert (active or cancelled) | `"HBC-" + ORIGINATOR + "-911"` | `HBC-KE8TQB-911` (a cancel reuses the alert's UID so TAK removes it) |
-| Mode 3 GeoChat | `"GeoChat.HBC-" + CALLSIGN + ".All Chat Rooms." + UUID4` | `GeoChat.HBC-KE8TQB.All Chat Rooms.f1907ab4-...` |
+| Mode 3 GeoChat — All Chat Rooms | `"GeoChat.HBC-" + CALLSIGN + ".All Chat Rooms." + UUID4`; `uid1="All Chat Rooms"` | `GeoChat.HBC-KE8TQB.All Chat Rooms.f1907ab4-...` |
+| Mode 3 GeoChat — Named Room | `"GeoChat.HBC-" + CALLSIGN + "." + ROOM + "." + UUID4`; `uid1=ROOM` (the literal room name, same convention as All Chat Rooms) | `GeoChat.HBC-KE8TQB.RECON TEAM.f1907ab4-...` |
+| Mode 3 GeoChat — Direct Message | `"GeoChat.HBC-" + CALLSIGN + ".HBC-" + RECIPIENT + "." + UUID4`; `uid1="HBC-" + RECIPIENT` | `GeoChat.HBC-KE8TQB.HBC-ONYX.f1907ab4-...` |
 | Mode 4 Shape | Random UUID4 | placed objects, like Spots |
 | Mode 5 CASEVAC | Random UUID4 | placed objects, like Spots |
 | Mode 6 Extended Marker | Random UUID4 | placed objects, like Spots |
@@ -294,8 +316,9 @@ conversion: CoT XML → field-by-field HBC encoding → packed bytes. For every
 field, the allowed values (options) are listed alongside the value chosen for
 that example. The Mode 2-5 examples are messages captured live from WinTAK
 (all coordinates throughout have been shifted away from their true positions
-for operator privacy); every bit stream and hex dump below is actual encoder
-output for the XML shown.
+for operator privacy), except the v1.4 Mode 3 Named Room and Direct Message
+examples, which are synthetic (illustrating the new destination fields);
+every bit stream and hex dump below is actual encoder output for the XML shown.
 
 Every mode shares the same header, which is worked in full detail in the
 Mode 1 example and abbreviated afterwards:
@@ -603,9 +626,18 @@ Packed hex : 50 5C 13 78 2A 40 21 D4 91 50 D1 52 55 91 4B DC F5 86 C0 D8
 
 ### Mode 3 — GeoChat (`b-t-f`)
 
-The chat message "test message" sent to All Chat Rooms during the capture.
+Since v1.4, Mode 3 carries a 2-bit **Destination Kind** immediately after
+the header, before the message text: `00` All Chat Rooms (broadcast,
+default), `01` Named Room, `10` Direct Message, `11` reserved. The encoder
+classifies incoming CoT by inspecting `<__chat>`/`<chatgrp>`: no chatroom or
+chatroom = "All Chat Rooms" → broadcast; a `<chatgrp>` with 3 or more
+`uidN` members → Named Room (the chatroom name is transmitted); otherwise
+(exactly `uid0` + `uid1`) → Direct Message (the chatroom name — which ATAK
+sets to the recipient's callsign for a 1:1 conversation — is transmitted as
+the recipient). This section walks all three destinations through the same
+"RECEIVER" station used elsewhere in this document.
 
-#### Input CoT XML
+#### All Chat Rooms (default) — "test message"
 
 ```xml
 <event version="2.0" uid="GeoChat.S-1-5-21....All Chat Rooms.3f8d87e7" type="b-t-f"
@@ -624,34 +656,117 @@ The chat message "test message" sent to All Chat Rooms during the capture.
 </event>
 ```
 
-#### Field-by-field encoding
-
 ```
 Header
   Callsign 'RECEIVER' (from __chat/@senderCallsign)               [45 bits]
   Version   → 000
   Mode 3    → 010
 
-Payload — Message (the ONLY payload field)
-  Encoding: ITA2, 5 bits/char, terminated by CR (01000).
-  Options per character: A-Z + space (letters table); 0-9 and punctuation
-  (figures table, FIGS/LTRS shifts inserted automatically); lowercase is
-  folded to UPPERCASE; any character with no ITA2 code becomes '?'.
-  Length: unlimited (bounded only by the transport frame).
-  No coordinate fields exist in this mode — WinTAK chat carries lat=0 lon=0,
-  so nothing real is lost.
+Payload
+  Destination Kind [2 bits]  chatroom = "All Chat Rooms"  →  00
+  Message  ITA2, 5 bits/char, CR-terminated (01000). Options per character:
+  A-Z + space (letters table); 0-9 and punctuation (figures table,
+  FIGS/LTRS shifts inserted automatically); lowercase folds to UPPERCASE;
+  characters with no ITA2 code become '?'. Length unlimited (bounded only
+  by the transport frame). No coordinate fields exist in this mode —
+  WinTAK chat carries lat=0 lon=0, so nothing real is lost.
 
   'test message' folds to 'TEST MESSAGE':
   T=10000 E=00001 S=00101 T=10000 SP=00100 M=11100
   E=00001 S=00101 S=00101 A=00011 G=11010 E=00001 + CR=01000      [65 bits]
 
-Total      : 116 bits → 15 bytes   (captured XML was 997 B → 98% smaller)
-Packed hex : 50 5C 13 78 2A 40 50 09 60 4E 04 A5 1E 82 80
+Total      : 118 bits → 15 bytes   (captured XML was 997 B → 98% smaller)
+Packed hex : 50 5C 13 78 2A 40 44 02 58 13 81 29 47 A0 A0
 ```
 
 Decoded: a `b-t-f` event addressed to "All Chat Rooms" with
 `senderCallsign="RECEIVER"`, text `TEST MESSAGE`, point 0/0, and
 `uid="GeoChat.HBC-RECEIVER.All Chat Rooms.{fresh-UUID4}"`.
+
+#### Named Room — RECEIVER → "Recon Team": "status check"
+
+```xml
+<event version="2.0" uid="GeoChat.S-1-5-21.9f8e7d6c.a1b2c3d4" type="b-t-f"
+       time="2026-08-25T14:02:11.00Z" start="2026-08-25T14:02:11.00Z"
+       stale="2026-08-26T14:02:11.00Z" how="h-g-i-g-o">
+  <point lat="0" lon="0" hae="9999999.0" ce="9999999.0" le="9999999.0" />
+  <detail>
+    <__chat id="9f8e7d6c-..." chatroom="Recon Team" senderCallsign="RECEIVER"
+            groupOwner="false" messageId="a1b2c3d4-...">
+      <chatgrp id="9f8e7d6c-..." uid0="S-1-5-21" uid1="ANDROID-aaaa" uid2="ANDROID-bbbb" />
+    </__chat>
+    <link uid="S-1-5-21" type="a-f-G-U" relation="p-p" />
+    <remarks source="BAO.F.WinTAK.S-1-5-21" to="Recon Team"
+             time="2026-08-25T14:02:11.00Z">status check</remarks>
+  </detail>
+</event>
+```
+
+```
+Header
+  Callsign 'RECEIVER'                                              [45 bits]
+  Version → 000    Mode 3 → 010
+
+Payload
+  Destination Kind [2 bits]  <chatgrp> has 3 uidN members (uid0/1/2)  →  01
+  Room Name  ITA2, CR-terminated, same rules as Message. 'Recon Team'
+  folds to 'RECON TEAM':
+  R=01010 E=00001 C=01110 O=11000 N=01100 SP=00100
+  T=10000 E=00001 A=00011 M=11100 + CR=01000                      [55 bits]
+  Message  'status check' folds to 'STATUS CHECK':
+  S=00101 T=10000 A=00011 T=10000 U=00111 S=00101 SP=00100
+  C=01110 H=10100 E=00001 C=01110 K=01111 + CR=01000               [65 bits]
+
+Total      : 173 bits → 22 bytes
+Packed hex : 50 5C 13 78 2A 40 4A 82 EC 30 90 08 F8 82 C0 70 39 48 EA 05 CF 40
+```
+
+Decoded: a `b-t-f` event with `chatroom="RECON TEAM"`, `id="RECON TEAM"`,
+`chatgrp uid1="RECON TEAM"` (the literal room name is used as its own UID,
+the same convention "All Chat Rooms" already uses), text `STATUS CHECK`,
+and `uid="GeoChat.HBC-RECEIVER.RECON TEAM.{fresh-UUID4}"`.
+
+#### Direct Message — RECEIVER → ONYX: "helo landing zone"
+
+```xml
+<event version="2.0" uid="GeoChat.S-1-5-21.c07f979e.e0295a69" type="b-t-f"
+       time="2026-08-25T14:05:00.00Z" start="2026-08-25T14:05:00.00Z"
+       stale="2026-08-26T14:05:00.00Z" how="h-g-i-g-o">
+  <point lat="0" lon="0" hae="9999999.0" ce="9999999.0" le="9999999.0" />
+  <detail>
+    <__chat id="c07f979e-..." chatroom="ONYX" senderCallsign="RECEIVER"
+            groupOwner="false" messageId="e0295a69-...">
+      <chatgrp id="c07f979e-..." uid0="S-1-5-21" uid1="ANDROID-onyxuid" />
+    </__chat>
+    <link uid="S-1-5-21" type="a-f-G-U" relation="p-p" />
+    <remarks source="BAO.F.WinTAK.S-1-5-21" to="ONYX"
+             time="2026-08-25T14:05:00.00Z">helo landing zone</remarks>
+  </detail>
+</event>
+```
+
+```
+Header
+  Callsign 'RECEIVER'                                              [45 bits]
+  Version → 000    Mode 3 → 010
+
+Payload
+  Destination Kind [2 bits]  <chatgrp> has exactly uid0+uid1  →  10
+  Recipient  ITA2, CR-terminated, same alphabet/8-char limit as the header
+  callsign. Taken from chatroom="ONYX":
+  O=11000 N=01100 Y=10101 X=11101 + CR=01000                       [25 bits]
+  Message  'helo landing zone' folds to 'HELO LANDING ZONE'
+  (H E L O SP L A N D I N G SP Z O N E), 17 chars + CR              [90 bits]
+
+Total      : 168 bits → 21 bytes
+Packed hex : 50 5C 13 78 2A 40 56 19 5E A2 81 96 09 21 B1 26 66 89 1C 30 28
+```
+
+Decoded: a `b-t-f` event with `chatroom="ONYX"`, `id="ONYX"`, `chatgrp
+uid1="HBC-ONYX"` (the deterministic PLI UID rule, so the message
+correlates with ONYX's existing HBC contact if one exists), `remarks
+to="HBC-ONYX"`, text `HELO LANDING ZONE`, and
+`uid="GeoChat.HBC-RECEIVER.ONYX.{fresh-UUID4}"`.
 
 ### Mode 4 — Shape (`u-d-c-c` / `u-d-r` / `u-d-f`)
 

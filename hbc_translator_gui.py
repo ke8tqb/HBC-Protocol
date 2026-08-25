@@ -143,8 +143,8 @@ EXAMPLE_XML = '''<event version="2.0" uid="ANDROID-KE8TQB-001" type="a-f-G-U-C"
   </detail>
 </event>'''
 
-# Mode 3 GeoChat: RECEIVER -> "TEST MESSAGE" (15 bytes)
-EXAMPLE_HEX = '50 5C 13 78 2A 40 50 09 60 4E 04 A5 1E 82 80'
+# Mode 3 GeoChat, All Chat Rooms: RECEIVER -> "TEST MESSAGE" (15 bytes)
+EXAMPLE_HEX = '50 5C 13 78 2A 40 44 02 58 13 81 29 47 A0 A0'
 
 
 # ---------------------------------------------------------------------------
