@@ -64,6 +64,28 @@ _DEFAULT_MODE     = 1          # Mode 1 for all unrecognised types
 # CoT type prefixes that produce a PLI bit of 0 (moving unit)
 _PLI_PREFIXES     = ('a-f-G', 'a-h-G', 'a-n-G')
 
+# =============================================================================
+# MODE 6 (v1.3) — Extended Marker constants
+# =============================================================================
+# Type-token charset: index into 0-9 (0-9), A-Z (10-35), a-z (36-61); 6 bits.
+TOKEN_CHARSET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+
+# Spot-map standard color palette (index 0-14; 15 = raw 32-bit ARGB follows).
+SPOT_COLORS = [
+    0xFFFFFFFF,  # 0 white   (-1)
+    0xFFFFFF00,  # 1 yellow  (-256)
+    0xFFFF0000,  # 2 red     (-65536)
+    0xFF00FF00,  # 3 green   (-16711936)
+    0xFF0000FF,  # 4 blue    (-16776961)
+    0xFFFFA500,  # 5 orange
+    0xFFFF00FF,  # 6 magenta (-65281)
+    0xFF00FFFF,  # 7 cyan    (-16711681)
+    0xFF000000,  # 8 black   (-16777216)
+    0xFF808080,  # 9 gray
+    0xFFA52A2A,  # 10 brown
+    0xFF800080,  # 11 purple
+]
+
 
 # =============================================================================
 # ITA2 ENCODING TABLES  (HBC Protocol Spec — Table 1)
@@ -167,6 +189,10 @@ class HBCMessage:
     medevac:  dict = field(default_factory=dict)
     med_bits: str  = field(default='', repr=False)
 
+    # Mode 6 — Extended Marker (v1.3); complete payload prebuilt by the builder
+    icon_kind:  int = 0     # 0 none, 1 2525C, 2 spotmap, 3 custom iconset
+    mode6_bits: str = field(default='', repr=False)
+
     # -------------------------------------------------------------------------
     # Derived properties
     # -------------------------------------------------------------------------
@@ -201,6 +227,9 @@ class HBCMessage:
             # Title + 9-line numeric fields + position
             return (self.name_len_bits + self.name_ascii_bits
                     + self.med_bits + self.lat_bits + self.lon_bits)
+        if self.mode == 6:
+            # Extended marker: name + position + type tokens + icon + tint
+            return self.mode6_bits
         raise ValueError(f'Unsupported mode: {self.mode}')
 
     @property
@@ -422,6 +451,8 @@ def _parse_xml(data) -> dict:
     # ------------------------------------------------------------------
     if hbc_mode == 1:
         callsign = name = ''
+        iconpath = ''
+        tint = None
         if detail is not None:
             uid_el = detail.find('uid')
             if uid_el is not None:
@@ -435,8 +466,23 @@ def _parse_xml(data) -> dict:
             creator = detail.find('creator')
             if creator is not None:
                 callsign = creator.get('callsign', callsign)
+            usericon = detail.find('usericon')
+            if usericon is not None:
+                iconpath = usericon.get('iconsetpath', '')
+            color = detail.find('color')
+            if color is not None and color.get('argb'):
+                try:
+                    tint = int(color.get('argb'))
+                except ValueError:
+                    tint = None
         if not name:
             name = callsign
+        if _is_spot(cot_type):
+            # v1.3: spots/markers prefer Mode 6 (extended marker);
+            # encode() falls back to Mode 1 if unencodable.
+            return dict(hbc_mode=6, cot_type=cot_type,
+                        callsign=callsign, name=name, lat=lat, lon=lon,
+                        iconpath=iconpath, tint=tint)
         return dict(hbc_mode=1, cot_type=cot_type,
                     callsign=callsign, name=name, lat=lat, lon=lon)
 
@@ -879,6 +925,93 @@ def _build_mode5(*, cot_type, callsign, title, med, lat, lon, source_format) -> 
     )
 
 
+def _build_mode6(*, cot_type, callsign, name, lat, lon, iconpath, tint,
+                 source_format) -> HBCMessage:
+    """Mode 6 — Extended Marker (HBC v1.3).
+
+    Wire format (payload only; header is standard callsign+version+mode 101):
+      name_len   [3 bits] + name ASCII [0-56 bits]
+      latitude   [21 bits] + longitude [22 bits]
+      type       [4-bit token count N] + N x [6-bit charset index]
+                 (dash-separated single-char tokens of the CoT type;
+                  charset = 0-9, A-Z, a-z)
+      icon_kind  [2 bits]
+        00 none        derive symbol purely from the CoT type
+        01 2525C       receiver rebuilds COT_MAPPING_2525C/<a-x>/<type>
+        10 spot map    + palette index [4 bits] (15 = raw ARGB [32 bits])
+        11 custom set  + iconset UUID [128 bits] + subpath (ITA2, CR-term)
+      tint       [1 bit]  (1 -> 32-bit ARGB <color> follows; suppressed for
+                           spot map, whose color is carried above)
+
+    Raises ValueError when unencodable (multi-char type tokens, non-UUID
+    custom paths) so encode() can fall back to Mode 1.
+    """
+    tokens = cot_type.split('-')
+    if not (1 <= len(tokens) <= 15):
+        raise ValueError(f'Mode 6: token count {len(tokens)}')
+    token_idx = []
+    for t in tokens:
+        if len(t) != 1 or t not in TOKEN_CHARSET:
+            raise ValueError(f'Mode 6: bad token {t!r}')
+        token_idx.append(TOKEN_CHARSET.index(t))
+
+    # icon kind
+    spot_argb = 0
+    uuid_bytes = b''
+    subpath = ''
+    if not iconpath:
+        kind = 0
+    elif iconpath.startswith('COT_MAPPING_2525'):
+        kind = 1
+    elif iconpath.startswith('COT_MAPPING_SPOTMAP'):
+        kind = 2
+        try:
+            spot_argb = int(iconpath.split('/')[-1]) & 0xFFFFFFFF
+        except ValueError:
+            spot_argb = (tint & 0xFFFFFFFF) if tint is not None else 0xFFFFFFFF
+    else:
+        import uuid as _uuid
+        if len(iconpath) < 37 or iconpath[36] != '/':
+            raise ValueError('Mode 6: iconsetpath not UUID-prefixed')
+        try:
+            uuid_bytes = _uuid.UUID(iconpath[:36]).bytes
+        except ValueError:
+            raise ValueError('Mode 6: bad iconset UUID')
+        subpath = iconpath[37:]
+        kind = 3
+
+    cs_bits = _ita2_encode_callsign(callsign)
+    name_enc, name_trunc, name_len_bits, name_ascii_bits = _encode_name(name)
+    lat_int, lat_bits, lon_int, lon_bits = _encode_coords(lat, lon)
+
+    bits = name_len_bits + name_ascii_bits + lat_bits + lon_bits
+    bits += format(len(tokens), '04b')
+    bits += ''.join(format(i, '06b') for i in token_idx)
+    bits += format(kind, '02b')
+    if kind == 2:
+        if spot_argb in [c & 0xFFFFFFFF for c in SPOT_COLORS]:
+            bits += format([c & 0xFFFFFFFF for c in SPOT_COLORS].index(spot_argb), '04b')
+        else:
+            bits += format(15, '04b') + format(spot_argb, '032b')
+    elif kind == 3:
+        bits += ''.join(format(b, '08b') for b in uuid_bytes)
+        bits += _ita2_encode_text(subpath)
+    if kind != 2 and tint is not None:
+        bits += '1' + format(tint & 0xFFFFFFFF, '032b')
+    else:
+        bits += '0'
+
+    return HBCMessage(
+        mode=6, source_format=source_format, cot_type=cot_type,
+        callsign=callsign, lat=lat, lon=lon,
+        lat_int=lat_int, lon_int=lon_int,
+        callsign_bits=cs_bits, lat_bits=lat_bits, lon_bits=lon_bits,
+        name=name_enc, name_truncated=name_trunc,
+        name_len_bits=name_len_bits, name_ascii_bits=name_ascii_bits,
+        icon_kind=kind, mode6_bits=bits,
+    )
+
+
 # ADDING A NEW MODE — builder:
 # def _build_modeN(*, cot_type, callsign, <mode-specific fields>, lat, lon, source_format) -> HBCMessage:
 #     ...
@@ -894,7 +1027,7 @@ _BUILDERS = {
     3: _build_mode3,
     4: _build_mode4,
     5: _build_mode5,
-    # 6: _build_mode6,   ← add new modes here
+    6: _build_mode6,
 }
 
 
@@ -924,6 +1057,15 @@ def encode(data) -> HBCMessage:
     builder = _BUILDERS.get(mode)
     if builder is None:
         raise ValueError(f'No builder registered for HBC mode {mode}')
+    if mode == 6:
+        try:
+            return builder(source_format=fmt, **fields)
+        except ValueError:
+            # unencodable as extended marker -> plain Mode 1 spot
+            fields = dict(cot_type=fields['cot_type'],
+                          callsign=fields['callsign'], name=fields['name'],
+                          lat=fields['lat'], lon=fields['lon'])
+            return _build_mode1(source_format=fmt, **fields)
     return builder(source_format=fmt, **fields)
 
 

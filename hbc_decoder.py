@@ -219,6 +219,15 @@ class HBCDecodedMessage:
     # Mode 5 — CASEVAC (`name` above is reused for the title)
     medevac: dict = field(default_factory=dict)
 
+    # Mode 6 — Extended Marker (v1.3)
+    cot_type:     str = ''    # reconstructed full CoT type string
+    icon_kind:    int = 0     # 0 none, 1 2525C, 2 spotmap, 3 custom iconset
+    spot_argb:    int = 0     # signed 32-bit ARGB (spot map)
+    iconset_uuid: str = ''    # lowercase hyphenated iconset uuid
+    icon_subpath: str = ''
+    has_tint:     bool = False
+    tint_argb:    int = 0
+
     # -------------------------------------------------------------------------
     # CoT XML reconstruction
     # -------------------------------------------------------------------------
@@ -260,6 +269,8 @@ class HBCDecodedMessage:
             return self._xml_mode4(now, ts)
         if self.mode == 5:
             return self._xml_mode5(now, ts)
+        if self.mode == 6:
+            return self._xml_mode6(now, ts)
         # ADDING A NEW MODE — to_xml:
         # Add an `if self.mode == N:` branch here.
         raise ValueError(f'No XML reconstruction for mode {self.mode}')
@@ -529,6 +540,50 @@ class HBCDecodedMessage:
         ET.indent(root, space='  ')
         return ET.tostring(root, encoding='unicode', xml_declaration=False)
 
+    def _xml_mode6(self, now, ts) -> str:
+        """Mode 6 — Extended Marker.  Rebuilds the full CoT type plus the
+        icon reference (2525C path, spot-map color, or custom iconset
+        UUID/path) and optional tint.  UID is a fresh UUID4."""
+        uid_val = str(uuid.uuid4())
+        stale   = now + timedelta(days=365)
+        root = ET.Element('event', {
+            'version': '2.0',
+            'uid':     uid_val,
+            'type':    self.cot_type,
+            'time':    ts(now),
+            'start':   ts(now),
+            'stale':   ts(stale),
+            'how':     'h-g-i-g-o',
+            'access':  'Undefined',
+        })
+        ET.SubElement(root, 'point', {
+            'lat': f'{self.lat:.6f}',
+            'lon': f'{self.lon:.6f}',
+            'hae': '9999999', 'ce': '9999999', 'le': '9999999',
+        })
+        detail = ET.SubElement(root, 'detail')
+        ET.SubElement(detail, 'contact',
+                      {'callsign': self.name or self.callsign})
+        ET.SubElement(detail, 'creator', {'callsign': self.callsign})
+        ET.SubElement(detail, 'archive')
+        if self.icon_kind == 1:
+            t = self.cot_type.split('-')
+            mid = '-'.join(t[:2]) if len(t) >= 2 else self.cot_type
+            ET.SubElement(detail, 'usericon', {
+                'iconsetpath': f'COT_MAPPING_2525C/{mid}/{self.cot_type}'})
+        elif self.icon_kind == 2:
+            ET.SubElement(detail, 'usericon', {
+                'iconsetpath':
+                    f'COT_MAPPING_SPOTMAP/b-m-p-s-m/{self.spot_argb}'})
+            ET.SubElement(detail, 'color', {'argb': str(self.spot_argb)})
+        elif self.icon_kind == 3:
+            ET.SubElement(detail, 'usericon', {
+                'iconsetpath': f'{self.iconset_uuid}/{self.icon_subpath}'})
+        if self.has_tint:
+            ET.SubElement(detail, 'color', {'argb': str(self.tint_argb)})
+        ET.indent(root, space='  ')
+        return ET.tostring(root, encoding='unicode', xml_declaration=False)
+
     def __str__(self) -> str:
         lines = [
             f'=== HBC Mode {self.mode} Decoded Message ===',
@@ -744,6 +799,43 @@ def _decode_mode5(reader: BitReader, callsign: str, version: int) -> HBCDecodedM
     )
 
 
+def _decode_mode6(reader: BitReader, callsign: str, version: int) -> HBCDecodedMessage:
+    """Mode 6 — Extended Marker (v1.3).
+    Payload: name + lat21 + lon22 + type tokens (4b count + 6b each) +
+    icon_kind (2b) [+ kind-specific fields] + tint (1b [+ argb32]).
+    """
+    from hbc_encoder import TOKEN_CHARSET, SPOT_COLORS
+    name = _decode_name(reader)
+    lat, lon = _decode_coords(reader)
+    count = reader.read_int(4)
+    cot_type = '-'.join(TOKEN_CHARSET[reader.read_int(6)] for _ in range(count))
+    kind = reader.read_int(2)
+    spot_argb = 0
+    iconset_uuid = ''
+    icon_subpath = ''
+    if kind == 2:
+        palette = reader.read_int(4)
+        if palette == 15:
+            spot_argb = reader.read_signed(32)
+        else:
+            c = SPOT_COLORS[min(palette, len(SPOT_COLORS) - 1)]
+            spot_argb = c - 0x100000000 if c >= 0x80000000 else c
+    elif kind == 3:
+        import uuid as _uuid
+        raw = bytes(reader.read_int(8) for _ in range(16))
+        iconset_uuid = str(_uuid.UUID(bytes=raw))
+        icon_subpath = _ita2_decode_text(reader)
+    has_tint = reader.read_int(1) == 1
+    tint_argb = reader.read_signed(32) if has_tint else 0
+    return HBCDecodedMessage(
+        mode=6, version=version, callsign=callsign,
+        lat=lat, lon=lon, name=name, cot_type=cot_type,
+        icon_kind=kind, spot_argb=spot_argb,
+        iconset_uuid=iconset_uuid, icon_subpath=icon_subpath,
+        has_tint=has_tint, tint_argb=tint_argb,
+    )
+
+
 # ADDING A NEW MODE — decoder:
 # def _decode_modeN(reader: BitReader, callsign: str, version: int) -> HBCDecodedMessage:
 #     # Read payload fields from `reader` in the order defined in the spec.
@@ -760,7 +852,7 @@ _DECODERS = {
     3: _decode_mode3,
     4: _decode_mode4,
     5: _decode_mode5,
-    # 6: _decode_mode6,   ← add new modes here
+    6: _decode_mode6,
 }
 
 
@@ -834,7 +926,7 @@ if __name__ == '__main__':
                 <contact callsign="U.17.124805" />
               </detail>
             </event>''',
-         dict(mode=1, is_spot=True, name='U.17.12', lat=39.8717, lon=-100.3245)),
+         dict(mode=6, name='U.17.12', lat=39.8717, lon=-100.3245)),
 
         # Cancel test uses the actual cancel CoT from ATAK (Alerts.xml)
         ('Mode 2 — XML Alert Cancel (KEYSTON)',

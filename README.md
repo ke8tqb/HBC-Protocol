@@ -32,7 +32,15 @@ The header always contains the transmitting station's callsign in ITA2 encoding,
 
 ## Protocol Version
 
-**Version 1.2** — Modes 1 through 5 defined.
+**Version 1.3** — Modes 1 through 6 defined.
+
+v1.3 adds Mode 6 (Extended Marker): placed markers now transmit their full
+CoT type string plus an icon reference (MIL-STD-2525 mapping, spot-map
+color, or custom iconset UUID + path) and optional color tint, so receivers
+render the correct symbol instead of a generic unknown marker. Encoders
+prefer Mode 6 for all non-PLI point events and fall back to Mode 1 when a
+type/icon is not Mode 6-encodable. The wire header is unchanged; v1.2
+decoders reject Mode 6 frames as an unknown mode.
 
 v1.2 merges the former Alert (Mode 2) and Alert Cancel (Mode 3) into a single
 Mode 2 with a 1-bit alert status, and renumbers GeoChat/Shape/CASEVAC down to
@@ -52,8 +60,9 @@ compatible with v1.1 bit streams.
 | Mode 3 | `010` | GeoChat Text Message | `b-t-f` |
 | Mode 4 | `011` | Shape (circle / rectangle / freeform) | `u-d-c-c`, `u-d-r`, `u-d-f` |
 | Mode 5 | `100` | CASEVAC / MEDEVAC | `b-r-f-h-c` |
+| Mode 6 | `101` | Extended Marker (type + icon + tint) | any non-PLI point event |
 
-Modes 6 (`101`), 7 (`110`), and 8 (`111`) are reserved for future versions (e.g. Expanded PLI).
+Modes 7 (`110`) and 8 (`111`) are reserved for future versions (e.g. Expanded PLI).
 
 ---
 
@@ -106,6 +115,32 @@ PAYLOAD (mode-dependent)
       Per extra point:
         Delta Latitude  14 bits (signed x10,000 from previous point, max ±0.8191°)
         Delta Longitude 14 bits (signed x10,000 from previous point, max ±0.8191°)
+
+  Mode 6 — Extended Marker (v1.3)
+    Name Length         3 bits  (000 = no name, 001-111 = 1-7 chars)
+    Name                0-56 bits  (ASCII, max 7 chars)
+    Latitude            21 bits (two's complement x10,000)
+    Longitude           22 bits (two's complement x10,000)
+    Type Token Count    4 bits  (1-15)
+    Type Tokens         6 bits each — index into charset 0-9 (0-9),
+                        A-Z (10-35), a-z (36-61). One token per dash-separated
+                        element of the CoT type ("a-h-G-U-C-I" = 6 tokens).
+                        Multi-character tokens are not Mode 6-encodable and
+                        force a Mode 1 fallback.
+    Icon Kind           2 bits
+                        00 = none      (receiver derives symbol from type)
+                        01 = 2525C     (receiver rebuilds
+                                        COT_MAPPING_2525C/<a-x>/<full type>)
+                        10 = spot map  + 4-bit palette index (see below);
+                                       index 15 = raw 32-bit ARGB follows
+                        11 = custom    + 128-bit iconset UUID (binary)
+                                       + icon subpath, ITA2-encoded,
+                                         CR-terminated
+    Tint Present        1 bit   (1 = 32-bit ARGB <color> follows; always 0
+                                 for spot map, whose color is carried above)
+
+    Spot palette: 0 white, 1 yellow, 2 red, 3 green, 4 blue, 5 orange,
+    6 magenta, 7 cyan, 8 black, 9 gray, 10 brown, 11 purple, 15 = raw ARGB.
 
   Mode 5 — CASEVAC / MEDEVAC (9-line)
     Title Length        3 bits  (000 = no title, 001-111 = 1-7 chars)
