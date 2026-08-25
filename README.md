@@ -25,6 +25,8 @@ Standard CoT XML used by TAK software (ATAK, WinTAK, iTAK) is 500–1000+ bytes 
 | Drawing circle | ~1,300 B | **22 bytes** |
 | Drawing rectangle (4 corners) | ~1,200 B | **31 bytes** |
 | CASEVAC (9-line) | ~900 B | **26 bytes** |
+| Extended marker (2525 symbol + tint) | ~420 B | **24 bytes** |
+| Extended marker (custom iconset icon) | ~500 B | **49 bytes** |
 
 The header always contains the transmitting station's callsign in ITA2 encoding, satisfying **FCC Part 97** identification requirements.
 
@@ -116,6 +118,25 @@ PAYLOAD (mode-dependent)
         Delta Latitude  14 bits (signed x10,000 from previous point, max ±0.8191°)
         Delta Longitude 14 bits (signed x10,000 from previous point, max ±0.8191°)
 
+  Mode 5 — CASEVAC / MEDEVAC (9-line)
+    Title Length        3 bits  (000 = no title, 001-111 = 1-7 chars)
+    Title               0-56 bits  (ASCII, max 7 chars)
+    Frequency           16 bits (10 kHz steps, 0 = unknown, 0-655.35 MHz)   [line 2]
+    Urgent              4 bits  (patient count by precedence, 0-15)         [line 3]
+    Urgent Surgical     4 bits
+    Priority            4 bits
+    Routine             4 bits
+    Convenience         4 bits
+    Litter              4 bits  (patient count, 0-15)                       [line 5]
+    Ambulatory          4 bits
+    Flags               4 bits  (bit3 = casevac, bit2 = equipment_none,
+                                 bit1 = terrain_none, bit0 = reserved)      [lines 4/9]
+    Security            2 bits  (0-3)                                       [line 6]
+    HLZ Marking         3 bits  (0-7)                                       [line 7]
+    Zone Protection     2 bits  (0-3)
+    Latitude            21 bits (two's complement x10,000)                  [line 1]
+    Longitude           22 bits (two's complement x10,000)
+
   Mode 6 — Extended Marker (v1.3)
     Name Length         3 bits  (000 = no name, 001-111 = 1-7 chars)
     Name                0-56 bits  (ASCII, max 7 chars)
@@ -141,25 +162,6 @@ PAYLOAD (mode-dependent)
 
     Spot palette: 0 white, 1 yellow, 2 red, 3 green, 4 blue, 5 orange,
     6 magenta, 7 cyan, 8 black, 9 gray, 10 brown, 11 purple, 15 = raw ARGB.
-
-  Mode 5 — CASEVAC / MEDEVAC (9-line)
-    Title Length        3 bits  (000 = no title, 001-111 = 1-7 chars)
-    Title               0-56 bits  (ASCII, max 7 chars)
-    Frequency           16 bits (10 kHz steps, 0 = unknown, 0-655.35 MHz)   [line 2]
-    Urgent              4 bits  (patient count by precedence, 0-15)         [line 3]
-    Urgent Surgical     4 bits
-    Priority            4 bits
-    Routine             4 bits
-    Convenience         4 bits
-    Litter              4 bits  (patient count, 0-15)                       [line 5]
-    Ambulatory          4 bits
-    Flags               4 bits  (bit3 = casevac, bit2 = equipment_none,
-                                 bit1 = terrain_none, bit0 = reserved)      [lines 4/9]
-    Security            2 bits  (0-3)                                       [line 6]
-    HLZ Marking         3 bits  (0-7)                                       [line 7]
-    Zone Protection     2 bits  (0-3)
-    Latitude            21 bits (two's complement x10,000)                  [line 1]
-    Longitude           22 bits (two's complement x10,000)
 ```
 
 ---
@@ -171,6 +173,7 @@ PAYLOAD (mode-dependent)
 | `hbc_encoder.py` | Encodes CoT XML or TAK Protocol (takproto) binary to HBC bytes |
 | `hbc_decoder.py` | Decodes HBC bytes to `HBCDecodedMessage` with `.to_xml()` |
 | `hbc_translator_gui.py` | Copy/paste GUI translator: CoT XML ⇄ HBC (hex or bit string). Run with `python hbc_translator_gui.py`; `--selftest` checks the translation logic without opening a window |
+| `crosscheck_mode6.py` | Mode 6 interoperability vectors — verifies this implementation is byte-for-byte identical to the companion ATAK plugin's Java port |
 | `requirements.txt` | Python dependencies |
 
 ---
@@ -256,7 +259,8 @@ present in the header, using a fixed formula:
 | Mode 3 GeoChat | `"GeoChat.HBC-" + CALLSIGN + ".All Chat Rooms." + UUID4` | `GeoChat.HBC-KE8TQB.All Chat Rooms.f1907ab4-...` |
 | Mode 4 Shape | Random UUID4 | placed objects, like Spots |
 | Mode 5 CASEVAC | Random UUID4 | placed objects, like Spots |
-| Future modes | `"HBC-" + CALLSIGN + "-M" + mode` | `HBC-KE8TQB-M6` |
+| Mode 6 Extended Marker | Random UUID4 | placed objects, like Spots |
+| Future modes | `"HBC-" + CALLSIGN + "-M" + mode` | `HBC-KE8TQB-M7` |
 
 **Why callsign-based UIDs work:**
 - Ham radio callsigns are **globally unique by ITU/FCC regulation** and stable for the
@@ -305,8 +309,9 @@ Transmitter Callsign   ITA2, 5 bits/char, CR-terminated (01000), max 8 chars.
 Version                3 bits.  Options: 000 = v1 (only defined value;
                        001-111 reserved).
 Mode                   3 bits, value = mode number - 1.  Options:
-                       000 = PLI/Spot   001 = Alert   010 = GeoChat
-                       011 = Shape      100 = CASEVAC   101-111 reserved
+                       000 = PLI/Spot   001 = Alert    010 = GeoChat
+                       011 = Shape      100 = CASEVAC  101 = Extended Marker
+                       110-111 reserved
 ```
 
 ### Mode 1 — PLI / Spot (`a-f-G-*`, `a-u-G`, ...)
@@ -360,7 +365,7 @@ Callsign bits: 01111 00001 11011 00110 11111 10000 10111 11001 01000  [45 bits]
 
 ##### Header: Version and Mode
 
-Version options: `000` only (v1). Mode options: `000`-`100` = Modes 1-5.
+Version options: `000` only (v1). Mode options: `000`-`101` = Modes 1-6.
 This message is a position report, so Mode 1 is chosen:
 
 ```
@@ -502,9 +507,13 @@ Timestamps reflect the decode time, not the original capture time.
 
 #### Spot variant (PLI bit = 1)
 
-The same Mode 1 layout carries dropped markers. For a captured unknown-ground
-spot (`a-u-G`) named `U.17.124805` placed by ONYX, the header callsign comes
-from `creator/@callsign` and the name from `contact/@callsign`:
+The same Mode 1 layout carries dropped markers. Since v1.3 the encoder
+prefers Mode 6 for placed markers (see below); Mode 1 Spot remains the wire
+format receivers must still accept, and the automatic fallback whenever a
+marker is not Mode 6-encodable (e.g. multi-character type tokens). For a
+captured unknown-ground spot (`a-u-G`) named `U.17.124805` placed by ONYX,
+the header callsign comes from `creator/@callsign` and the name from
+`contact/@callsign`:
 
 ```
 Callsign 'ONYX' : O=11000 N=01100 Y=10101 X=11101 + CR 01000        [25 bits]
@@ -930,10 +939,48 @@ The encoder accepts CoT XML and TAK Protocol (takproto) protobuf binary:
 
 ## Adding a New Mode
 
-Both files contain `# ADDING A NEW MODE` comment markers at every extension point, and use dispatch tables (`_BUILDERS` in the encoder, `_DECODERS` in the decoder). To add Mode 6:
+Both files contain `# ADDING A NEW MODE` comment markers at every extension point, and use dispatch tables (`_BUILDERS` in the encoder, `_DECODERS` in the decoder). To add Mode 7:
 
-1. **Encoder** — add a CoT type entry in `_MODE_BY_COT_TYPE`, parser blocks in `_parse_xml` and `_parse_takproto`, a `_build_mode6()` function, and register it in `_BUILDERS`.
-2. **Decoder** — add a `_decode_mode6()` function, register it in `_DECODERS`, and add an XML reconstruction branch in `HBCDecodedMessage.to_xml()`.
+1. **Encoder** — add a CoT type entry in `_MODE_BY_COT_TYPE`, parser blocks in `_parse_xml` and `_parse_takproto`, a `_build_mode7()` function, and register it in `_BUILDERS`.
+2. **Decoder** — add a `_decode_mode7()` function, register it in `_DECODERS`, and add an XML reconstruction branch in `HBCDecodedMessage.to_xml()`.
+
+---
+
+## Credits & Acknowledgements
+
+All code in this repository is original. The protocol builds on, and the
+wider HBC system interoperates with, the following work:
+
+- **Cursor on Target (CoT)** — event schema and type hierarchy by **The
+  MITRE Corporation** (CoT Base-Event Schema and sub-schemas, public
+  release, MITRE Case #11-3895). CoT is a U.S. Government/MITRE-defined
+  message standard; this project implements an independent binary encoding
+  of it and is not affiliated with or endorsed by MITRE or the TAK Product
+  Center.
+- **[takproto](https://github.com/snstac/takproto)** by Sensors & Signals
+  LLC (Apache-2.0) — optional dependency used only to parse TAK Protocol
+  protobuf input; installed from upstream, not bundled here.
+- **ITA2 / Baudot code** — the callsign/text alphabet is the public-domain
+  International Telegraph Alphabet No. 2 (CCITT, 1932).
+- **ATAK / TAK** — the Android Team Awareness Kit is developed by the TAK
+  Product Center; the companion HBC ATAK plugin is built against the
+  publicly released ATAK-CIV SDK under its own terms.
+
+Companion transport implementations (separate projects, not part of this
+repository) additionally use and credit:
+
+- **[javAX25](https://github.com/sivantoledo/javAX25)** by Sivan Toledo,
+  with CRC code adapted from **soundmodem** by Thomas Sailer — AFSK1200
+  AX.25 modem (GPL v2 or later; distributions bundling it are provided
+  under GPL-compatible terms).
+- **[aicodix / rattlegram](https://github.com/aicodix/rattlegram)** COFDMTV
+  OFDM modem by Ahmet Inan (permissive ISC-style license).
+- **[APRSdroid](https://github.com/ge0rg/aprsdroid)** by Georg Lukas and
+  **jsoundmodem** by Bastian Mueller — studied as reference implementations
+  for Android audio-modem behavior.
+
+"ATAK", "TAK", and "MIL-STD-2525" are identifiers of their respective
+owners; use here is nominative only.
 
 ---
 
