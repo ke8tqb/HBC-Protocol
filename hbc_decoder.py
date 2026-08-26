@@ -220,6 +220,12 @@ class HBCDecodedMessage:
     chat_room:      str = ''   # room name (dest kind 1)
     chat_recipient: str = ''   # recipient callsign (dest kind 2)
     chat_msg_tag:   int = 0    # DM 16-bit message tag (v1.6)
+    # Receiver-side hook: when the DM recipient is this station, set this to
+    # the local TAK device UID before to_xml(). ATAK's chat service files a
+    # 1:1 message into the chat window only when chatgrp/uid1 equals the
+    # local device UID; the derived HBC-{CALLSIGN} UID is the fallback used
+    # when the real UID is unknown (e.g. offline decoding).
+    chat_recipient_uid_override: str = ''
 
     # Mode 0 — Ack (v1.6)
     ack_kind:      int = 0     # 0 = delivered (b-t-f-d), 1 = read (b-t-f-r)
@@ -453,8 +459,14 @@ class HBCDecodedMessage:
             to_attr  = room_id
         elif self.chat_dest_kind == 2:            # Direct Message
             display  = self.chat_recipient.upper()
-            dest_uid = f'{HBC_UID_PREFIX}-{display}'
-            room_id  = display
+            # Prefer the real local device UID (receiver-side substitution;
+            # see chat_recipient_uid_override) so ATAK files the message
+            # into the chat window; fall back to the derived contact UID.
+            dest_uid = self.chat_recipient_uid_override \
+                or f'{HBC_UID_PREFIX}-{display}'
+            # Real ATAK 1:1 wire format uses the recipient UID as the
+            # conversation id and the peer callsign as the chatroom label.
+            room_id  = dest_uid
             to_attr  = dest_uid
         else:                                     # All Chat Rooms (default)
             room_id = dest_uid = display = to_attr = 'All Chat Rooms'
