@@ -66,6 +66,27 @@ _DEFAULT_MODE     = 1          # Mode 1 for all unrecognised types
 _PLI_PREFIXES     = ('a-f-G', 'a-h-G', 'a-n-G')
 
 # =============================================================================
+# MODE 1 (v1.5) — Affiliation labeling
+# =============================================================================
+# 2-bit field recording the atom affiliation so Mode 1 decode reconstructs
+# the correct type instead of always collapsing to Friendly (PLI) or Unknown
+# (Spot). Order matches the 2-bit wire code.
+_AFFILIATION_PREFIXES = ('a-f-G', 'a-h-G', 'a-n-G', 'a-u-G')
+#                          0=Friendly  1=Hostile  2=Neutral  3=Unknown
+
+
+def _detect_affiliation(cot_type: str) -> int:
+    """Map a CoT type to its 2-bit Mode 1 affiliation code. Types with no
+    atom affiliation prefix (e.g. 'b-m-p-c-cp' Command Post, which is not an
+    'a-' atom at all) default to Unknown (3) — the same safe fallback Mode 1
+    always used before this field existed."""
+    for code, prefix in enumerate(_AFFILIATION_PREFIXES):
+        if cot_type.startswith(prefix):
+            return code
+    return 3
+
+
+# =============================================================================
 # MODE 3 (v1.4) — GeoChat destination kinds
 # =============================================================================
 # 2-bit field selecting who a GeoChat message is addressed to. All Chat Rooms
@@ -174,6 +195,8 @@ class HBCMessage:
     name:             str  = ''
     name_truncated:   bool = False
     pli_bit:          str  = field(default='', repr=False)
+    affiliation:      int  = 3   # 0 Friendly, 1 Hostile, 2 Neutral, 3 Unknown
+    affiliation_bits: str  = field(default='', repr=False)
     name_len_bits:    str  = field(default='', repr=False)
     name_ascii_bits:  str  = field(default='', repr=False)
 
@@ -223,7 +246,8 @@ class HBCMessage:
     @property
     def payload_bits(self) -> str:
         if self.mode == 1:
-            return (self.pli_bit + self.name_len_bits + self.name_ascii_bits
+            return (self.pli_bit + self.affiliation_bits
+                    + self.name_len_bits + self.name_ascii_bits
                     + self.lat_bits + self.lon_bits)
         if self.mode == 2:
             # Alert status bit + alert name + originator + position
@@ -281,8 +305,11 @@ class HBCMessage:
         ]
         if self.mode == 1:
             trunc = '  (TRUNCATED)' if self.name_truncated else ''
+            affil_name = {0: 'Friendly', 1: 'Hostile', 2: 'Neutral', 3: 'Unknown'}.get(
+                self.affiliation, '?')
             lines += [
                 f'  PLI/Spot      : {"Spot(1)" if self.is_spot else "PLI(0)"}  ->  {self.pli_bit}',
+                f'  affiliation   : {affil_name}({self.affiliation})  ->  {self.affiliation_bits}',
                 f'  name_len      : {len(self.name)} chars{trunc}  ->  {self.name_len_bits}',
                 f'  name          : {self.name!r}  ->  {self.name_ascii_bits}  [{len(self.name_ascii_bits)}b]',
             ]
@@ -825,7 +852,23 @@ def _parse_takproto(data: bytes) -> dict:
 # =============================================================================
 
 def _build_mode1(*, cot_type, callsign, name, lat, lon, source_format) -> HBCMessage:
+    """Mode 1 — Minimum PLI or Spot Message (v1.5 adds Affiliation).
+
+    Wire format (payload only; header is standard callsign+version+mode):
+      PLI or Spot ID  [1 bit]   0 = PLI moving unit, 1 = Spot/Marker
+      Affiliation     [2 bits]  00 Friendly (a-f-G), 01 Hostile (a-h-G),
+                                10 Neutral (a-n-G), 11 Unknown (a-u-G or any
+                                type with no atom affiliation prefix)
+      Name Length     [3 bits] + Name ASCII [0-56 bits]
+      Latitude        [21 bits] + Longitude [22 bits]
+
+    v1.4 and earlier decoders ignored affiliation entirely and always
+    reconstructed PLI as Friendly (a-f-G) and Spot as Unknown (a-u-G),
+    silently mislabeling hostile/neutral units and any spot/marker that
+    fell back to Mode 1 from an unencodable Mode 6 type.
+    """
     spot = _is_spot(cot_type)
+    affiliation = _detect_affiliation(cot_type)
     cs_bits = _ita2_encode_callsign(callsign)
     name_enc, name_trunc, name_len_bits, name_ascii_bits = _encode_name(name)
     lat_int, lat_bits, lon_int, lon_bits = _encode_coords(lat, lon)
@@ -836,6 +879,7 @@ def _build_mode1(*, cot_type, callsign, name, lat, lon, source_format) -> HBCMes
         callsign_bits=cs_bits, lat_bits=lat_bits, lon_bits=lon_bits,
         is_spot=spot, name=name_enc, name_truncated=name_trunc,
         pli_bit='1' if spot else '0',
+        affiliation=affiliation, affiliation_bits=format(affiliation, '02b'),
         name_len_bits=name_len_bits, name_ascii_bits=name_ascii_bits,
     )
 
@@ -1179,6 +1223,33 @@ if __name__ == '__main__':
                 <contact callsign="U.17.124805" />
               </detail>
             </event>'''),
+
+        ('Mode 1 (v1.5) — XML Hostile PLI (a-h-G-U-C)',
+         '''<event version="2.0" uid="ANDROID-hostile001" type="a-h-G-U-C" how="m-g">
+              <point lat="39.871776" lon="-98.324262" hae="9999999" ce="9999999" le="9999999" />
+              <detail><contact callsign="BANDIT1" /><uid Droid="BANDIT1" /></detail>
+            </event>'''),
+
+        ('Mode 1 (v1.5) — XML Neutral PLI (a-n-G-U-C)',
+         '''<event version="2.0" uid="ANDROID-neutral001" type="a-n-G-U-C" how="m-g">
+              <point lat="39.871776" lon="-98.324262" hae="9999999" ce="9999999" le="9999999" />
+              <detail><contact callsign="CIVIC1" /><uid Droid="CIVIC1" /></detail>
+            </event>'''),
+
+        # Real capture: Command Post (b-m-p-c-cp) has a 2-char type token
+        # ('cp'), which Mode 6 cannot encode, so it falls back to Mode 1.
+        # It is not an 'a-' atom type at all, so it correctly labels as
+        # Unknown rather than the pre-v1.5 hardcoded 'a-u-G' -- same visual
+        # result here, but now honestly derived instead of a coincidence.
+        ('Mode 1 (v1.5) — XML Command Post fallback (b-m-p-c-cp, captured)',
+         '''<event version="2.0" uid="246b95d0-ba26-4577-a1c8-918276dff506" type="b-m-p-c-cp"
+              how="h-g-i-g-o">
+            <point lat="39.6227396" lon="-84.2035144" hae="9999999" ce="9999999" le="9999999" />
+            <detail>
+              <creator uid="ANDROID-60a23e2d48e13de0" callsign="FAF" type="a-f-G-U-C" />
+              <contact callsign="FAF.25.194409" />
+            </detail>
+          </event>'''),
 
         ('Mode 2 — XML Alert Cancel (KEYSTON cancel)',
          '''<event version="2.0" uid="ANDROID-6faa524f341bc5a0-9-1-1" type="b-a-o-can"

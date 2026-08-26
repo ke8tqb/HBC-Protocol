@@ -289,7 +289,7 @@ def run_selftest() -> int:
     d, _s, _o, hex_out = translate(EXAMPLE_XML)
     check('detect XML', d == 'xml->hbc')
     check('Mode 1 hex matches README vector',
-          hex_out == '78 76 6F C2 F9 40 0C 96 8A 70 A8 A2 84 61 57 EC 3F CD 40',
+          hex_out == '78 76 6F C2 F9 40 03 25 A2 9C 2A 28 A1 18 55 FB 0F F3 50',
           hex_out)
 
     # HBC hex -> XML (round-trip the bytes we just produced)

@@ -45,6 +45,10 @@ MAX_CS_CHARS   = 8
 # Mode number → CoT type for PLI and Spot reconstruction
 _COT_TYPE_PLI      = 'a-f-G'      # Mode 1 PLI  (moving unit, friendly ground track)
 _COT_TYPE_SPOT     = 'a-u-G'      # Mode 1 Spot (map marker)
+
+# Mode 1 (v1.5) 2-bit Affiliation code -> reconstructed atom type.
+# Order matches the wire code: 0 Friendly, 1 Hostile, 2 Neutral, 3 Unknown.
+_AFFILIATION_TYPES = (_COT_TYPE_PLI, 'a-h-G', 'a-n-G', _COT_TYPE_SPOT)
 _COT_TYPE_ALERT    = 'b-a-o-tbl'  # Mode 2 Alert (active)
 _COT_TYPE_CANCEL   = 'b-a-o-can'  # Mode 2 Alert (cancelled)
 _COT_TYPE_CHAT     = 'b-t-f'      # Mode 3 GeoChat
@@ -201,8 +205,9 @@ class HBCDecodedMessage:
     lon:       float
 
     # Mode 1
-    is_spot:   bool = False
-    name:      str  = ''
+    is_spot:     bool = False
+    name:        str  = ''
+    affiliation: int  = 3   # 0 Friendly, 1 Hostile, 2 Neutral, 3 Unknown
 
     # Mode 2 — Alert (active or cancelled)
     alert_active: bool = True
@@ -280,13 +285,16 @@ class HBCDecodedMessage:
         raise ValueError(f'No XML reconstruction for mode {self.mode}')
 
     def _xml_mode1(self, now, ts) -> str:
-        uid_val = _derive_uid(self.callsign, mode=1, is_spot=self.is_spot)
+        """Mode 1 — PLI/Spot. v1.5 uses the decoded Affiliation field to pick
+        the reconstructed atom type (Friendly/Hostile/Neutral/Unknown)
+        instead of always collapsing PLI to Friendly and Spot to Unknown."""
+        uid_val  = _derive_uid(self.callsign, mode=1, is_spot=self.is_spot)
+        cot_type = _AFFILIATION_TYPES[self.affiliation] \
+            if 0 <= self.affiliation < len(_AFFILIATION_TYPES) else _COT_TYPE_SPOT
         if self.is_spot:
-            cot_type = _COT_TYPE_SPOT
             how      = 'h-g-i-g-o'
             stale    = now + timedelta(days=365)
         else:
-            cot_type = _COT_TYPE_PLI
             how      = 'm-g'
             stale    = now + timedelta(minutes=5)
 
@@ -612,8 +620,11 @@ class HBCDecodedMessage:
             f'  callsign : {self.callsign!r}',
         ]
         if self.mode == 1:
+            affil_name = {0: 'Friendly', 1: 'Hostile', 2: 'Neutral', 3: 'Unknown'}.get(
+                self.affiliation, '?')
             lines += [
                 f'  PLI/Spot : {"Spot" if self.is_spot else "PLI"}',
+                f'  affiliation : {affil_name}',
                 f'  name     : {self.name!r}',
             ]
         elif self.mode == 2:
@@ -729,13 +740,17 @@ def _decode_coords(reader: BitReader):
 # =============================================================================
 
 def _decode_mode1(reader: BitReader, callsign: str, version: int) -> HBCDecodedMessage:
-    """Mode 1 — Minimum PLI or Spot Message."""
-    is_spot = bool(reader.read_int(1))   # PLI/Spot bit
-    name    = _decode_name(reader)
-    lat, lon = _decode_coords(reader)
+    """Mode 1 — Minimum PLI or Spot Message (v1.5 adds Affiliation).
+    Payload: PLI/Spot bit (1b) + Affiliation (2b) + name + lat21 + lon22.
+    """
+    is_spot     = bool(reader.read_int(1))   # PLI/Spot bit
+    affiliation = reader.read_int(2)         # 0 Friendly, 1 Hostile, 2 Neutral, 3 Unknown
+    name        = _decode_name(reader)
+    lat, lon    = _decode_coords(reader)
     return HBCDecodedMessage(
         mode=1, version=version, callsign=callsign,
         lat=lat, lon=lon, is_spot=is_spot, name=name,
+        affiliation=affiliation,
     )
 
 
@@ -968,6 +983,35 @@ if __name__ == '__main__':
             </event>''',
          dict(mode=6, name='U.17.12', lat=39.8717, lon=-100.3245)),
 
+        ('Mode 1 (v1.5) — XML Hostile PLI (a-h-G-U-C)',
+         '''<event version="2.0" uid="ANDROID-hostile001" type="a-h-G-U-C" how="m-g">
+              <point lat="39.871776" lon="-98.324262" hae="9999999" ce="9999999" le="9999999" />
+              <detail><contact callsign="BANDIT1" /><uid Droid="BANDIT1" /></detail>
+            </event>''',
+         dict(mode=1, is_spot=False, affiliation=1, name='BANDIT1', lat=39.8718, lon=-98.3243)),
+
+        ('Mode 1 (v1.5) — XML Neutral PLI (a-n-G-U-C)',
+         '''<event version="2.0" uid="ANDROID-neutral001" type="a-n-G-U-C" how="m-g">
+              <point lat="39.871776" lon="-98.324262" hae="9999999" ce="9999999" le="9999999" />
+              <detail><contact callsign="CIVIC1" /><uid Droid="CIVIC1" /></detail>
+            </event>''',
+         dict(mode=1, is_spot=False, affiliation=2, name='CIVIC1', lat=39.8718, lon=-98.3243)),
+
+        # Real capture: Command Post (b-m-p-c-cp) has a 2-char type token
+        # ('cp'), so Mode 6 rejects it and it falls back to Mode 1. It has no
+        # atom affiliation prefix, so it correctly reports Unknown (3).
+        ('Mode 1 (v1.5) — XML Command Post fallback (b-m-p-c-cp, captured)',
+         '''<event version="2.0" uid="246b95d0-ba26-4577-a1c8-918276dff506" type="b-m-p-c-cp"
+              how="h-g-i-g-o">
+            <point lat="39.6227396" lon="-84.2035144" hae="9999999" ce="9999999" le="9999999" />
+            <detail>
+              <creator uid="ANDROID-60a23e2d48e13de0" callsign="FAF" type="a-f-G-U-C" />
+              <contact callsign="FAF.25.194409" />
+            </detail>
+          </event>''',
+         dict(mode=1, is_spot=True, affiliation=3, name='FAF.25.',
+              lat=39.6227, lon=-84.2035)),
+
         # Cancel test uses the actual cancel CoT from ATAK (Alerts.xml)
         ('Mode 2 — XML Alert Cancel (KEYSTON)',
          '''<event version="2.0" uid="ANDROID-6faa524f341bc5a0-9-1-1" type="b-a-o-can"
@@ -1137,6 +1181,8 @@ if __name__ == '__main__':
             assert dec.version == HBC_VERSION,                           f'version mismatch: {dec.version}'
             if 'is_spot' in expected:
                 assert dec.is_spot == expected['is_spot'],               f'is_spot mismatch: {dec.is_spot}'
+            if 'affiliation' in expected:
+                assert dec.affiliation == expected['affiliation'],       f'affiliation mismatch: {dec.affiliation}'
             if 'name' in expected:
                 assert dec.name == expected['name'],                     f'name mismatch: {dec.name!r}'
             if 'alert_name' in expected:

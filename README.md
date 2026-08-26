@@ -34,7 +34,20 @@ The header always contains the transmitting station's callsign in ITA2 encoding,
 
 ## Protocol Version
 
-**Version 1.4** — Modes 1 through 6 defined.
+**Version 1.5** — Modes 1 through 6 defined.
+
+v1.5 adds a 2-bit **Affiliation** field to Mode 1 (`00` Friendly `a-f-G`,
+`01` Hostile `a-h-G`, `10` Neutral `a-n-G`, `11` Unknown `a-u-G`). v1.4 and
+earlier decoders ignored affiliation entirely: PLI always reconstructed as
+Friendly and Spot always as Unknown, regardless of what was actually sent.
+This silently mislabeled hostile/neutral PLI units as friendly, and
+relabeled any spot/marker that fell back to Mode 1 (because its full type
+or icon was not Mode 6-encodable, e.g. a CoT type with a multi-character
+dash-token such as `b-m-p-c-cp` Command Post) as a generic "Unknown Ground
+Unit" no matter what it actually was. The wire header and PLI/Spot bit are
+unchanged; the Affiliation field is inserted immediately after that bit, so
+v1.5 Mode 1 bit streams are NOT compatible with v1.4 and earlier Mode 1
+frames.
 
 v1.4 updates Mode 3 (GeoChat) to carry an addressed destination instead of
 always broadcasting to All Chat Rooms. A new 2-bit destination-kind field
@@ -91,8 +104,11 @@ HEADER (variable length)
 
 PAYLOAD (mode-dependent)
 
-  Mode 1 — PLI / Spot
+  Mode 1 — PLI / Spot (v1.5)
     PLI or Spot ID      1 bit   (0 = PLI moving unit, 1 = Spot/Marker)
+    Affiliation         2 bits  (00 = Friendly a-f-G, 01 = Hostile a-h-G,
+                                 10 = Neutral a-n-G, 11 = Unknown a-u-G or
+                                 any type with no atom affiliation prefix)
     Name Length         3 bits  (000 = no name, 001-111 = 1-7 chars)
     Name                0-56 bits  (ASCII, max 7 chars)
     Latitude            21 bits (two's complement x10,000, ~11 m precision)
@@ -407,7 +423,20 @@ atom type — a placed marker, decoded under a fresh UUID4). This event is
 PLI (moving unit)  →  0  [1 bit]
 ```
 
-##### Payload Field 2 — Name Length
+##### Payload Field 2 — Affiliation (v1.5)
+
+Options: `00` Friendly (`a-f-G`) · `01` Hostile (`a-h-G`) · `10` Neutral
+(`a-n-G`) · `11` Unknown (`a-u-G`, or any type with no atom affiliation
+prefix). This lets the decoder rebuild the correct type instead of always
+assuming Friendly for PLI and Unknown for Spot (see the Hostile/Neutral and
+Command Post examples below). This event is `a-f-G-U-C`, which starts with
+`a-f-G`:
+
+```
+Friendly  →  00  [2 bits]
+```
+
+##### Payload Field 3 — Name Length
 
 Options: `000` = no name … `111` = 7 characters. Longer names are truncated
 to 7 and the encoder flags the truncation. `KE8TQB` fits at 6:
@@ -416,7 +445,7 @@ to 7 and the encoder flags the truncation. `KE8TQB` fits at 6:
 "KE8TQB" = 6 characters  →  110  [3 bits]
 ```
 
-##### Payload Field 3 — Name (ASCII, 8 bits per character; any 0x00-0xFF byte)
+##### Payload Field 4 — Name (ASCII, 8 bits per character; any 0x00-0xFF byte)
 
 ```
 'K' (0x4B =  75)  →  01001011
@@ -429,7 +458,7 @@ to 7 and the encoder flags the truncation. `KE8TQB` fits at 6:
 Name bits: 01001011 01000101 00111000 01010100 01010001 01000010  [48 bits]
 ```
 
-##### Payload Field 4 — Latitude (21-bit two's complement, ×10,000; valid -90° to +90°)
+##### Payload Field 5 — Latitude (21-bit two's complement, ×10,000; valid -90° to +90°)
 
 ```
 Input        :  39.871776°
@@ -439,7 +468,7 @@ round()      :  398,718
 Decode check :  398,718 ÷ 10,000 = 39.871800°  (±2.7 m)
 ```
 
-##### Payload Field 5 — Longitude (22-bit two's complement, ×10,000; valid -180° to +180°)
+##### Payload Field 6 — Longitude (22-bit two's complement, ×10,000; valid -180° to +180°)
 
 ```
 Input        : -98.324262°
@@ -449,21 +478,21 @@ round()      : -983,243
 Decode check : -983,243 ÷ 10,000 = -98.324300°  (±4.2 m)
 ```
 
-##### Complete bit stream (146 bits / 19 bytes)
+##### Complete bit stream (148 bits / 19 bytes)
 
 ```
-  Callsign (45b)               Ver  Mode P NLen  Name (48b)                       Lat (21b)             Lon (22b)
-  011110000111011001101111110000101111100101000 000 000 0 110 010010110100010100111000010101000101000101000010 001100001010101111110 1100001111111100110101
+  Callsign (45b)               Ver  Mode P Aff NLen  Name (48b)                       Lat (21b)             Lon (22b)
+  011110000111011001101111110000101111100101000 000 000 0 00 110 010010110100010100111000010101000101000101000010 001100001010101111110 1100001111111100110101
 
   Rows (32 bits per row):
     0–31  :  01111000 01110110 01101111 11000010
-   32–63  :  11111001 01000000 00001100 10010110
-   64–95  :  10001010 01110000 10101000 10100010
-  96–127  :  10000100 01100001 01010111 11101100
-  128–145 :  00111111 11001101 01
+   32–63  :  11111001 01000000 00000011 00100101
+   64–95  :  10100010 10011100 00101010 00101000
+  96–127  :  10100001 00011000 01010101 11111011
+  128–147 :  00001111 11110011 0101
 
   Packed hex (19 bytes):
-  78 76 6F C2 F9 40 0C 96 8A 70 A8 A2 84 61 57 EC 3F CD 40
+  78 76 6F C2 F9 40 03 25 A2 9C 2A 28 A1 18 55 FB 0F F3 50
 ```
 
 #### Step 3 — HBC Decoding (binary → fields)
@@ -528,7 +557,7 @@ Timestamps reflect the decode time, not the original capture time.
 > sentinel values in the original message (no GPS fix), HBC causes **zero data
 > loss** for those fields.
 
-#### Spot variant (PLI bit = 1)
+#### Spot variant (PLI bit = 1, Affiliation = Unknown)
 
 The same Mode 1 layout carries dropped markers. Since v1.3 the encoder
 prefers Mode 6 for placed markers (see below); Mode 1 Spot remains the wire
@@ -542,16 +571,100 @@ the header callsign comes from `creator/@callsign` and the name from
 Callsign 'ONYX' : O=11000 N=01100 Y=10101 X=11101 + CR 01000        [25 bits]
 Version / Mode  : 000 / 000
 PLI/Spot bit    : 1     (a-u-G is not an a-f-G / a-h-G / a-n-G type)
+Affiliation     : 11    (Unknown — a-u-G has no other affiliation match)
 Name            : 111 + 'U.17.12'  ('U.17.124805' truncated to 7)   [3+56 bits]
 Latitude        :  39.871743  →  398717   →  001100001010101111101
 Longitude       : -100.324462 → -1003245  →  1100001011000100010011
 
-Total      : 134 bits → 17 bytes
-Packed hex : C3 2B D4 01 EA A5 C6 26 E5 C6 26 46 15 7D C2 C4 4C
+Total      : 136 bits → 17 bytes
+Packed hex : C3 2B D4 01 FA A9 71 89 B9 71 89 91 85 5F 70 B1 13
 ```
 
 On decode the spot is rebuilt as `a-u-G` with `how="h-g-i-g-o"`, a fresh
 UUID4 uid, a 1-year stale, and `<creator callsign="ONYX"/>`.
+
+#### Hostile and Neutral PLI (v1.5 — correct labeling)
+
+Before v1.5, Mode 1 decode **always** rebuilt PLI as Friendly (`a-f-G`)
+regardless of what was actually transmitted — a hostile or neutral track
+would silently show up on every receiver's map as friendly. The
+Affiliation field fixes this. Two otherwise-identical PLI reports, differing
+only in CoT type and callsign:
+
+```xml
+<event version="2.0" uid="ANDROID-hostile001" type="a-h-G-U-C" how="m-g">
+  <point lat="39.871776" lon="-98.324262" hae="9999999" ce="9999999" le="9999999" />
+  <detail><contact callsign="BANDIT1" /><uid Droid="BANDIT1" /></detail>
+</event>
+```
+
+```
+Callsign 'BANDIT1'                                                  [50 bits]
+Version / Mode  : 000 / 000
+PLI/Spot bit    : 0       (a-h-G-U-C starts with a-h-G → PLI)
+Affiliation     : 01      (Hostile)
+Name            : 111 + 'BANDIT1'                                [3+56 bits]
+Latitude/Longitude: same encoding as the KE8TQB example above
+
+Total      : 161 bits → 21 bytes
+Packed hex : C8 D8 93 43 77 FA 00 3D 09 05 39 11 25 50 C4 C2 AF D8 7F 9A 80
+```
+
+Decoded: `type="a-h-G"`, `uid="HBC-BANDIT1"` — correctly hostile, not friendly.
+
+```xml
+<event version="2.0" uid="ANDROID-neutral001" type="a-n-G-U-C" how="m-g">
+  <point lat="39.871776" lon="-98.324262" hae="9999999" ce="9999999" le="9999999" />
+  <detail><contact callsign="CIVIC1" /><uid Droid="CIVIC1" /></detail>
+</event>
+```
+
+```
+Callsign 'CIVIC1'                                                   [45 bits]
+PLI/Spot bit    : 0       (a-n-G-U-C starts with a-n-G → PLI)
+Affiliation     : 10      (Neutral)
+Name            : 110 + 'CIVIC1'                                 [3+48 bits]
+
+Total      : 148 bits → 19 bytes
+Packed hex : 71 BC 67 6E FF 40 0B 21 A4 AB 24 A1 98 98 55 FB 0F F3 50
+```
+
+Decoded: `type="a-n-G"`, `uid="HBC-CIVIC1"` — correctly neutral, not friendly.
+
+#### Known remaining gap: non-atom types still fall back to Unknown
+
+Affiliation only applies to `a-`-prefixed atom types (Friendly/Hostile/
+Neutral/Unknown ground). CoT "bits" types with no affiliation prefix — e.g.
+`b-m-p-c-cp` (Command Post), captured live from ATAK — still fall back to
+Mode 1 Unknown whenever Mode 6 can't encode them (here, because `cp` is a
+2-character dash-token and Mode 6's type-token field only supports single
+characters). v1.5 makes that fallback *honest* (Unknown is genuinely the
+best available label) instead of it being a side effect of a hardcoded
+constant, but it does not recover the Command Post icon itself:
+
+```xml
+<event version="2.0" uid="246b95d0-ba26-4577-a1c8-918276dff506" type="b-m-p-c-cp" how="h-g-i-g-o">
+  <point lat="39.6227396" lon="-84.2035144" hae="9999999" ce="9999999" le="9999999" />
+  <detail>
+    <creator uid="ANDROID-60a23e2d48e13de0" callsign="FAF" type="a-f-G-U-C" />
+    <contact callsign="FAF.25.194409" />
+  </detail>
+</event>
+```
+
+```
+Callsign 'FAF'  : F=01101 A=00011 F=01101 + CR 01000                [20 bits]
+PLI/Spot bit    : 1       (b-m-p-c-cp is not a PLI atom type → Spot)
+Affiliation     : 11      (Unknown — not an a-*-G atom type at all)
+Name            : 111 + 'FAF.25.'  ('FAF.25.194409' truncated to 7) [3+56 bits]
+
+Total      : 131 bits → 17 bytes
+Packed hex : 68 DA 80 3F 46 41 46 2E 32 35 2E 30 5E 1E 64 D9 A0
+```
+
+Recovering the exact Command Post icon would require widening Mode 6's
+type-token encoding to support multi-character tokens — tracked as a
+follow-up, not part of this change.
 
 ### Mode 2 — Alert, active or cancelled (`b-a-o-tbl` / `b-a-o-can`)
 

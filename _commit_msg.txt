@@ -1,0 +1,42 @@
+HBC v1.5: Mode 1 Affiliation field (fix hostile/neutral mislabeling and Unknown-Ground fallback)
+
+Adds a 2-bit Affiliation field to Mode 1, inserted right after the existing
+PLI/Spot bit: 00 Friendly (a-f-G), 01 Hostile (a-h-G), 10 Neutral (a-n-G),
+11 Unknown (a-u-G, or any type with no atom affiliation prefix).
+
+Root cause: v1.4 and earlier Mode 1 decode hardcoded the reconstructed type
+regardless of what was transmitted -- PLI always came back as Friendly
+(a-f-G) and Spot always as Unknown (a-u-G). This silently mislabeled
+hostile/neutral PLI units as friendly, and caused any spot/marker that fell
+back to Mode 1 (because Mode 6 could not encode its full type or icon, e.g.
+a CoT type with a multi-character dash-token like b-m-p-c-cp Command Post)
+to always render as a generic "Unknown Ground Unit" no matter what marker
+was actually placed. Confirmed against a real capture file spanning PLI,
+spot, and command-post events from live ATAK traffic.
+
+_detect_affiliation()/_AFFILIATION_TYPES map CoT type <-> the 2-bit code on
+both encode and decode; _build_mode1/_decode_mode1/_xml_mode1 updated
+accordingly. Types with no atom affiliation prefix (non-'a-' CoT types)
+correctly continue to default to Unknown, same as before, but now that is
+an honest classification rather than a hardcoded side effect.
+
+This is a wire-incompatible change to Mode 1's payload (v1.4 and earlier
+Mode 1 decoders will misparse v1.5 frames), consistent with the precedent
+set by the v1.4 Mode 3 destination-kind change.
+
+Updates hbc_encoder.py, hbc_decoder.py (new fields + hostile/neutral/
+command-post self-tests), hbc_translator_gui.py (corrected Mode 1 hex
+vector), README.md (protocol version, packet structure, worked examples
+with verified bit-accurate hex recomputed by running the encoder), and
+pyproject.toml (1.5.0). All self-tests and the Mode 6 Java crosscheck pass.
+
+Known follow-up (not fixed here, flagged in README): CoT types with
+multi-character dash-tokens (e.g. "cp" in b-m-p-c-cp) still fall back to
+Mode 1 Unknown instead of the exact icon, since Mode 6's type-token field
+only supports single characters. Also flagged separately: Mode 6's custom
+iconset subpath is ITA2-encoded (uppercase-only), which silently breaks
+case-sensitive icon file references; not changed here because it would
+alter Mode 6's wire format and risk breaking interop with the companion
+Java ATAK plugin, which this repository does not have access to.
+
+Co-Authored-By: Warp <agent@warp.dev>
