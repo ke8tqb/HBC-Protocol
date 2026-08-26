@@ -34,7 +34,19 @@ The header always contains the transmitting station's callsign in ITA2 encoding,
 
 ## Protocol Version
 
-**Version 1.5** — Modes 1 through 6 defined.
+**Version 1.6** — Modes 0 through 6 defined.
+
+v1.6 adds delivery/read receipts for Direct Messages:
+- Mode 3 DMs now carry a 16-bit **message tag** (CRC-16/CCITT-FALSE of the
+  sender's ATAK `messageId`) after the recipient callsign (+2 bytes).
+- New **Mode 0 — Ack**, carried on the previously reserved wire mode bits
+  `111`: recipient callsign (ITA2, CR-terminated) + ack kind (2 bits:
+  `00` delivered / `01` read) + the echoed 16-bit message tag (~12 bytes
+  total). The receiving station's plugin converts ATAK's automatic
+  `b-t-f-d`/`b-t-f-r` receipt events into Mode 0 acks; the original sender
+  maps the tag back to its `messageId` and reconstructs the receipt so
+  ATAK shows the delivered/read checkmark, matching same-IP-network
+  behavior. Wire-incompatible with v1.5 Mode 3 DM frames.
 
 v1.5 adds a 2-bit **Affiliation** field to Mode 1 (`00` Friendly `a-f-G`,
 `01` Hostile `a-h-G`, `10` Neutral `a-n-G`, `11` Unknown `a-u-G`). v1.4 and
@@ -83,6 +95,7 @@ compatible with v1.1 bit streams.
 
 | Mode | Bits | Description | CoT type |
 |---|---|---|---|
+| Mode 0 | `111` | Ack — DM delivery/read receipt (v1.6) | `b-t-f-d`, `b-t-f-r` |
 | Mode 1 | `000` | Minimum PLI or Spot Message | `a-f-G-*`, `a-u-G`, etc. |
 | Mode 2 | `001` | Alert Message — active or cancelled (1-bit status) | `b-a-o-tbl`, `b-a-o-can` |
 | Mode 3 | `010` | GeoChat Text Message | `b-t-f` |
@@ -125,7 +138,7 @@ PAYLOAD (mode-dependent)
     Latitude            21 bits (two's complement x10,000, ~11 m precision)
     Longitude           22 bits (two's complement x10,000, ~11 m precision)
 
-  Mode 3 — GeoChat (v1.4)
+  Mode 3 — GeoChat (v1.4, DM message tag added in v1.6)
     Destination Kind    2 bits  (00 = All Chat Rooms, 01 = Named Room,
                                  10 = Direct Message, 11 = reserved)
     Named Room:
@@ -133,9 +146,17 @@ PAYLOAD (mode-dependent)
     Direct Message:
       Recipient         ITA2-encoded, CR-terminated  (max 8 chars, same
                         alphabet as the header callsign)
+      Message Tag       16 bits (CRC-16/CCITT-FALSE of the sender's ATAK
+                        messageId; echoed back in Mode 0 acks)
     Message             ITA2-encoded, CR-terminated  (5 bits/char + shifts)
                         Uppercase only; non-ITA2 characters become '?'.
                         No coordinates are transmitted.
+
+  Mode 0 — Ack (v1.6, wire mode bits 111)
+    Recipient           ITA2-encoded, CR-terminated  (the original DM sender)
+    Ack Kind            2 bits  (00 = delivered b-t-f-d, 01 = read b-t-f-r,
+                                 10-11 = reserved)
+    Message Tag         16 bits (echoed from the acknowledged DM)
 
   Mode 4 — Shape
     Shape Kind          2 bits  (00 = circle, 01 = closed polygon,

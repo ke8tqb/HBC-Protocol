@@ -98,6 +98,29 @@ CHAT_DEST_DM   = 2   # 10 — Direct message to a single station callsign
 #                       11 — reserved
 
 # =============================================================================
+# MODE 0 (v1.6) — Ack (delivery / read receipt for Direct Messages)
+# =============================================================================
+# Mode 0 is carried on the previously reserved wire mode bits 111. It confirms
+# receipt of a Mode 3 Direct Message: the DM carries a 16-bit message tag
+# (CRC-16/CCITT-FALSE of the sender's ATAK messageId); the recipient's station
+# echoes that tag back with an ack kind so the sender's ATAK can show the
+# delivered/read checkmark (CoT types b-t-f-d / b-t-f-r).
+ACK_DELIVERED = 0    # 00 — message stored on the recipient EUD (b-t-f-d)
+ACK_READ      = 1    # 01 — message opened/read by the recipient (b-t-f-r)
+#                      10, 11 — reserved
+
+
+def crc16_ccitt(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF) — the DM message tag."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if (crc & 0x8000) else (crc << 1)
+            crc &= 0xFFFF
+    return crc
+
+# =============================================================================
 # MODE 6 (v1.3) — Extended Marker constants
 # =============================================================================
 # Type-token charset: index into 0-9 (0-9), A-Z (10-35), a-z (36-61); 6 bits.
@@ -217,6 +240,13 @@ class HBCMessage:
     chat_room:      str  = ''              # room name (dest kind 1)
     chat_recipient: str  = ''              # recipient callsign (dest kind 2)
     chat_dest_bits: str  = field(default='', repr=False)
+    chat_msg_tag:   int  = 0               # DM 16-bit message tag (v1.6)
+    chat_message_id: str = ''              # source ATAK messageId the tag hashes
+
+    # Mode 0 — Ack (v1.6); complete payload prebuilt by encode_ack()
+    ack_kind:      int = ACK_DELIVERED     # 0 delivered, 1 read
+    ack_recipient: str = ''                # original DM sender this ack targets
+    ack_bits:      str = field(default='', repr=False)
 
     # Mode 4 — Shape (name/name_len_bits/name_ascii_bits above are reused for the label)
     shape_kind:   int  = 0     # 0 = circle, 1 = closed polygon, 2 = open polyline
@@ -241,7 +271,9 @@ class HBCMessage:
 
     @property
     def mode_bits(self) -> str:
-        return format(self.mode - 1, '03b')
+        # Mode 0 (Ack, v1.6) rides on the previously reserved bit pattern 111;
+        # all other modes encode as (mode number - 1).
+        return '111' if self.mode == 0 else format(self.mode - 1, '03b')
 
     @property
     def payload_bits(self) -> str:
@@ -256,9 +288,13 @@ class HBCMessage:
                     + self.orig_len_bits  + self.orig_name_bits
                     + self.lat_bits + self.lon_bits)
         if self.mode == 3:
-            # Destination kind (2 bits) + optional room/recipient +
+            # Destination kind (2 bits) + optional room/recipient
+            # [+ 16-bit message tag for direct messages, v1.6] +
             # ITA2 message text, CR-terminated (no coordinates)
             return self.chat_dest_bits + self.chat_bits
+        if self.mode == 0:
+            # Ack: recipient callsign (ITA2, CR) + ack kind (2b) + tag (16b)
+            return self.ack_bits
         if self.mode == 4:
             # Shape kind + name + kind-specific body (coords live in shape_bits)
             return (format(self.shape_kind, '02b')
@@ -331,9 +367,20 @@ class HBCMessage:
             if self.chat_dest_kind == CHAT_DEST_ROOM:
                 lines += [f'  room          : {self.chat_room!r}']
             elif self.chat_dest_kind == CHAT_DEST_DM:
-                lines += [f'  recipient     : {self.chat_recipient!r}']
+                lines += [
+                    f'  recipient     : {self.chat_recipient!r}',
+                    f'  msg_tag       : 0x{self.chat_msg_tag:04X}  ->  {format(self.chat_msg_tag, "016b")}'
+                    + (f'  (from messageId {self.chat_message_id!r})' if self.chat_message_id else ''),
+                ]
             lines += [
                 f'  chat_text     : {self.chat_text!r}  ->  {self.chat_bits}  [{len(self.chat_bits)}b]',
+            ]
+        elif self.mode == 0:
+            kind_name = {0: 'DELIVERED', 1: 'READ'}.get(self.ack_kind, '?')
+            lines += [
+                f'  ack_kind      : {kind_name}({self.ack_kind})  ->  {format(self.ack_kind, "02b")}',
+                f'  recipient     : {self.ack_recipient!r}',
+                f'  msg_tag       : 0x{self.chat_msg_tag:04X}  ->  {format(self.chat_msg_tag, "016b")}',
             ]
         elif self.mode == 4:
             kind_name = {0: 'circle', 1: 'closed-polygon', 2: 'polyline'}.get(self.shape_kind, '?')
@@ -361,7 +408,7 @@ class HBCMessage:
                 f'terrain_none={m.get("terrain_none", False)}',
                 f'  sec/hlz/zone  : {m.get("security", 0)}/{m.get("hlz_marking", 0)}/{m.get("zone_prot", 0)}',
             ]
-        if self.mode != 3:
+        if self.mode not in (0, 3):
             lines += [
                 f'  lat           : {self.lat}  ->  {self.lat_int}  ->  {self.lat_bits}  [21b]',
                 f'  lon           : {self.lon}  ->  {self.lon_int}  ->  {self.lon_bits}  [22b]',
@@ -579,7 +626,7 @@ def _parse_xml(data) -> dict:
     #                                              ATAK labels a 1:1 chat tab)
     # ------------------------------------------------------------------
     if hbc_mode == 3:
-        sender = message = chatroom = ''
+        sender = message = chatroom = message_id = ''
         dest_kind = CHAT_DEST_ALL
         chat_room = chat_recipient = ''
         if detail is not None:
@@ -587,6 +634,7 @@ def _parse_xml(data) -> dict:
             if chat is not None:
                 sender = chat.get('senderCallsign', '')
                 chatroom = chat.get('chatroom', '') or chat.get('id', '')
+                message_id = chat.get('messageId', '')
                 chatgrp = chat.find('chatgrp')
                 member_count = 0
                 if chatgrp is not None:
@@ -607,7 +655,7 @@ def _parse_xml(data) -> dict:
         return dict(hbc_mode=3, cot_type=cot_type,
                     callsign=sender, message=message,
                     dest_kind=dest_kind, chat_room=chat_room,
-                    chat_recipient=chat_recipient)
+                    chat_recipient=chat_recipient, message_id=message_id)
 
     # ------------------------------------------------------------------
     # Mode 4 — Shape (circle / rectangle / freeform)
@@ -753,7 +801,7 @@ def _parse_takproto(data: bytes) -> dict:
     # ------------------------------------------------------------------
     if hbc_mode == 3:
         xd = cot.detail.xmlDetail or ''
-        sender = message = chatroom = ''
+        sender = message = chatroom = message_id = ''
         dest_kind = CHAT_DEST_ALL
         chat_room = chat_recipient = ''
         m = re.search(r'<__chat[^>]*\bsenderCallsign=["\']([^"\']*)["\']', xd)
@@ -762,6 +810,9 @@ def _parse_takproto(data: bytes) -> dict:
         m = re.search(r'<__chat[^>]*\bchatroom=["\']([^"\']*)["\']', xd)
         if m:
             chatroom = m.group(1)
+        m = re.search(r'<__chat[^>]*\bmessageId=["\']([^"\']*)["\']', xd)
+        if m:
+            message_id = m.group(1)
         cg = re.search(r'<chatgrp([^>]*)/?>', xd)
         member_count = len(re.findall(r'\buid\d+=', cg.group(1))) if cg else 0
         if not chatroom or chatroom.strip().lower() == 'all chat rooms':
@@ -778,7 +829,7 @@ def _parse_takproto(data: bytes) -> dict:
         return dict(hbc_mode=3, cot_type=cot_type,
                     callsign=sender, message=message,
                     dest_kind=dest_kind, chat_room=chat_room,
-                    chat_recipient=chat_recipient)
+                    chat_recipient=chat_recipient, message_id=message_id)
 
     # ------------------------------------------------------------------
     # Mode 4 — Shape (takproto path)
@@ -912,8 +963,9 @@ def _build_mode2(*, cot_type, callsign, alert_callsign, active, lat, lon, source
 
 
 def _build_mode3(*, cot_type, callsign, message, source_format,
-                  dest_kind=CHAT_DEST_ALL, chat_room='', chat_recipient='') -> HBCMessage:
-    """Mode 3 — GeoChat Text Message (v1.4 adds addressed destinations).
+                  dest_kind=CHAT_DEST_ALL, chat_room='', chat_recipient='',
+                  message_id='') -> HBCMessage:
+    """Mode 3 — GeoChat Text Message (v1.4 destinations, v1.6 DM message tag).
 
     Wire format (payload only; header is standard callsign+version+mode):
       dest_kind          [2 bits]  00 = All Chat Rooms, 01 = Named Room,
@@ -921,6 +973,9 @@ def _build_mode3(*, cot_type, callsign, message, source_format,
       [Named Room]       room name        ITA2, CR-terminated (free text)
       [Direct Message]   recipient        ITA2, CR-terminated (max 8 chars,
                                            same alphabet as the header callsign)
+                         message tag      16 bits — CRC-16/CCITT-FALSE of the
+                                           sender's ATAK messageId; echoed back
+                                           in Mode 0 acks (v1.6)
       message            ITA2-encoded, CR-terminated  (5 bits/char + shifts)
 
     No coordinates are transmitted — TAK chat events carry no meaningful
@@ -931,12 +986,15 @@ def _build_mode3(*, cot_type, callsign, message, source_format,
 
     dest_bits = format(dest_kind, '02b')
     room = recipient = ''
+    msg_tag = 0
     if dest_kind == CHAT_DEST_ROOM:
         room = chat_room
         dest_bits += _ita2_encode_text(chat_room)
     elif dest_kind == CHAT_DEST_DM:
         recipient = chat_recipient.upper()[:MAX_CS_CHARS]
         dest_bits += _ita2_encode_callsign(chat_recipient)
+        msg_tag = crc16_ccitt(message_id.encode('utf-8')) if message_id else 0
+        dest_bits += format(msg_tag, '016b')
 
     return HBCMessage(
         mode=3, source_format=source_format, cot_type=cot_type,
@@ -946,6 +1004,7 @@ def _build_mode3(*, cot_type, callsign, message, source_format,
         chat_text=message, chat_bits=chat_bits,
         chat_dest_kind=dest_kind, chat_room=room, chat_recipient=recipient,
         chat_dest_bits=dest_bits,
+        chat_msg_tag=msg_tag, chat_message_id=message_id,
     )
 
 
@@ -1200,6 +1259,40 @@ def encode(data) -> HBCMessage:
                           lat=fields['lat'], lon=fields['lon'])
             return _build_mode1(source_format=fmt, **fields)
     return builder(source_format=fmt, **fields)
+
+
+def encode_ack(*, callsign: str, recipient: str, kind: int,
+               msg_tag: int = None, message_id: str = None) -> HBCMessage:
+    """Encode a Mode 0 Ack (v1.6) — delivery/read receipt for a Direct Message.
+
+    Wire format (payload only; header is callsign + version + mode bits 111):
+      recipient  ITA2, CR-terminated (the original DM sender, max 8 chars)
+      ack kind   [2 bits]  00 = delivered (b-t-f-d), 01 = read (b-t-f-r)
+      msg tag    [16 bits] the tag carried by the original DM
+
+    Provide either msg_tag directly (echoing a received DM's tag) or
+    message_id (the receipt CoT's uid) to derive the tag via CRC-16.
+    """
+    if msg_tag is None:
+        if not message_id:
+            raise ValueError('encode_ack requires msg_tag or message_id')
+        msg_tag = crc16_ccitt(message_id.encode('utf-8'))
+    if kind not in (ACK_DELIVERED, ACK_READ):
+        raise ValueError(f'Invalid ack kind {kind}')
+    cs_bits  = _ita2_encode_callsign(callsign)
+    ack_bits = (_ita2_encode_callsign(recipient)
+                + format(kind, '02b')
+                + format(msg_tag & 0xFFFF, '016b'))
+    return HBCMessage(
+        mode=0, source_format='ack',
+        cot_type='b-t-f-r' if kind == ACK_READ else 'b-t-f-d',
+        callsign=callsign, lat=0.0, lon=0.0,
+        lat_int=0, lon_int=0,
+        callsign_bits=cs_bits, lat_bits='', lon_bits='',
+        ack_kind=kind, ack_recipient=recipient.upper()[:MAX_CS_CHARS],
+        ack_bits=ack_bits, chat_msg_tag=msg_tag & 0xFFFF,
+        chat_message_id=message_id or '',
+    )
 
 
 # =============================================================================

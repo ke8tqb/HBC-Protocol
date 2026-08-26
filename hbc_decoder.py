@@ -219,6 +219,15 @@ class HBCDecodedMessage:
     chat_dest_kind: int = 0     # 0 = All Chat Rooms, 1 = Named Room, 2 = Direct Message
     chat_room:      str = ''   # room name (dest kind 1)
     chat_recipient: str = ''   # recipient callsign (dest kind 2)
+    chat_msg_tag:   int = 0    # DM 16-bit message tag (v1.6)
+
+    # Mode 0 — Ack (v1.6)
+    ack_kind:      int = 0     # 0 = delivered (b-t-f-d), 1 = read (b-t-f-r)
+    ack_recipient: str = ''    # original DM sender this ack targets
+    # Set by the receiving plugin before to_xml(): the original ATAK
+    # messageId the tag maps to, so the receipt CoT uid matches the message
+    # ATAK has in its chat database (that is how the checkmark appears).
+    ack_message_id: str = ''
 
     # Mode 4 — Shape (`name` above is reused for the shape label)
     shape_kind:   int  = 0     # 0 = circle, 1 = closed polygon, 2 = open polyline
@@ -268,6 +277,8 @@ class HBCDecodedMessage:
         def ts(dt: datetime) -> str:
             return dt.strftime(fmt)[:-3] + 'Z'   # millisecond precision
 
+        if self.mode == 0:
+            return self._xml_mode0(now, ts)
         if self.mode == 1:
             return self._xml_mode1(now, ts)
         if self.mode == 2:
@@ -283,6 +294,38 @@ class HBCDecodedMessage:
         # ADDING A NEW MODE — to_xml:
         # Add an `if self.mode == N:` branch here.
         raise ValueError(f'No XML reconstruction for mode {self.mode}')
+
+    def _xml_mode0(self, now, ts) -> str:
+        """Mode 0 — Ack (v1.6).  Rebuilds an ATAK chat receipt event
+        (b-t-f-d delivered / b-t-f-r read).  ATAK matches receipts to chat
+        messages purely by the receipt event's UID, which must equal the
+        original message's messageId — set ack_message_id before calling
+        to_xml() (the receiving plugin looks it up from the 16-bit tag).
+        Falls back to a placeholder UID when the tag is unknown."""
+        cot_type = 'b-t-f-r' if self.ack_kind == 1 else 'b-t-f-d'
+        uid_val  = self.ack_message_id or f'HBC-ACK-{self.chat_msg_tag:04X}'
+        stale    = now + timedelta(minutes=5)
+        root = ET.Element('event', {
+            'version': '2.0',
+            'uid':     uid_val,
+            'type':    cot_type,
+            'time':    ts(now),
+            'start':   ts(now),
+            'stale':   ts(stale),
+            'how':     'h-g-i-g-o',
+            'access':  'Undefined',
+        })
+        ET.SubElement(root, 'point', {
+            'lat': '0', 'lon': '0',
+            'hae': '9999999', 'ce': '9999999', 'le': '9999999',
+        })
+        detail = ET.SubElement(root, 'detail')
+        ET.SubElement(detail, '__chatreceipt', {
+            'ackedUid':       uid_val,
+            'senderCallsign': self.callsign,
+        })
+        ET.indent(root, space='  ')
+        return ET.tostring(root, encoding='unicode', xml_declaration=False)
 
     def _xml_mode1(self, now, ts) -> str:
         """Mode 1 — PLI/Spot. v1.5 uses the decoded Affiliation field to pick
@@ -668,10 +711,17 @@ class HBCDecodedMessage:
                 f'terrain_none={m.get("terrain_none", False)}',
                 f'  sec/hlz/zone: {m.get("security", 0)}/{m.get("hlz_marking", 0)}/{m.get("zone_prot", 0)}',
             ]
-        lines += [
-            f'  lat      : {self.lat:.6f}',
-            f'  lon      : {self.lon:.6f}',
-        ]
+        elif self.mode == 0:
+            lines += [
+                f'  ack_kind  : {"READ" if self.ack_kind == 1 else "DELIVERED"}',
+                f'  recipient : {self.ack_recipient!r}',
+                f'  msg_tag   : 0x{self.chat_msg_tag:04X}',
+            ]
+        if self.mode not in (0, 3):
+            lines += [
+                f'  lat      : {self.lat:.6f}',
+                f'  lon      : {self.lon:.6f}',
+            ]
         return '\n'.join(lines)
 
 
@@ -771,23 +821,42 @@ def _decode_mode2(reader: BitReader, callsign: str, version: int) -> HBCDecodedM
 
 
 def _decode_mode3(reader: BitReader, callsign: str, version: int) -> HBCDecodedMessage:
-    """Mode 3 — GeoChat Text Message (v1.4 adds addressed destinations).
-    Payload: dest_kind (2b) + [room name | recipient callsign] + message
-    (ITA2, CR-terminated).  No coordinates on the wire.
+    """Mode 3 — GeoChat Text Message (v1.4 destinations, v1.6 DM message tag).
+    Payload: dest_kind (2b) + [room name | recipient callsign + tag16] +
+    message (ITA2, CR-terminated).  No coordinates on the wire.
     """
     dest_kind = reader.read_int(2)
     if dest_kind == 3:
         raise ValueError('Chat destination kind 11 is reserved')
     room = recipient = ''
+    msg_tag = 0
     if dest_kind == 1:
         room = _ita2_decode_text(reader)
     elif dest_kind == 2:
         recipient = _ita2_decode_callsign(reader)
+        msg_tag = reader.read_int(16)
     text = _ita2_decode_text(reader)
     return HBCDecodedMessage(
         mode=3, version=version, callsign=callsign,
         lat=0.0, lon=0.0, chat_text=text,
         chat_dest_kind=dest_kind, chat_room=room, chat_recipient=recipient,
+        chat_msg_tag=msg_tag,
+    )
+
+
+def _decode_mode0(reader: BitReader, callsign: str, version: int) -> HBCDecodedMessage:
+    """Mode 0 — Ack (v1.6, wire mode bits 111).
+    Payload: recipient callsign (ITA2, CR) + ack kind (2b) + msg tag (16b).
+    """
+    recipient = _ita2_decode_callsign(reader)
+    kind      = reader.read_int(2)
+    if kind > 1:
+        raise ValueError(f'Ack kind {kind} is reserved')
+    tag = reader.read_int(16)
+    return HBCDecodedMessage(
+        mode=0, version=version, callsign=callsign,
+        lat=0.0, lon=0.0,
+        ack_kind=kind, ack_recipient=recipient, chat_msg_tag=tag,
     )
 
 
@@ -902,6 +971,7 @@ def _decode_mode6(reader: BitReader, callsign: str, version: int) -> HBCDecodedM
 # Register new mode decoders here: mode_number -> decoder function
 # =============================================================================
 _DECODERS = {
+    0: _decode_mode0,   # Ack (v1.6, wire mode bits 111)
     1: _decode_mode1,
     2: _decode_mode2,
     3: _decode_mode3,
@@ -947,6 +1017,8 @@ def decode(data) -> HBCDecodedMessage:
     callsign = _ita2_decode_callsign(reader)   # variable-length, CR-terminated
     version  = reader.read_int(3) + 1          # 3-bit field (000 = version 1)
     mode     = reader.read_int(3) + 1          # 3-bit field (000 = mode 1)
+    if mode == 8:                              # wire bits 111 = Mode 0 Ack (v1.6)
+        mode = 0
 
     # ------------------------------------------------------------------
     # Payload — dispatch to mode-specific decoder
